@@ -28,8 +28,8 @@ except ImportError:
 
 
 HISTORY_YEARS = 5
-HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 StockResearchAgent/4.0"}
-SEC_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "IndividualInvestorResearchAgent/4.0 educational-use")}
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 StockResearchAgent/5.3"}
+SEC_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "IndividualInvestorResearchAgent/5.3 educational-use")}
 
 
 HORIZONS: list[dict[str, Any]] = [
@@ -88,6 +88,36 @@ HORIZONS: list[dict[str, Any]] = [
         "review": "每季度及投资逻辑变化时复核",
     },
 ]
+
+
+ANALOG_HORIZONS: list[dict[str, Any]] = [
+    {"name": "2—5个交易日", "days": 5, "minimum_gap": 20},
+    {"name": "2—4周", "days": 20, "minimum_gap": 20},
+    {"name": "1—3个月", "days": 60, "minimum_gap": 40},
+    {"name": "3—12个月", "days": 120, "minimum_gap": 60},
+]
+
+ANALOG_MIN_SAMPLES = 10
+ANALOG_MIN_SIMILARITY = 72.0
+ANALOG_SCORE_MIN_CONFIDENCE = 35
+ANALOG_FEATURE_WEIGHTS: dict[str, float] = {
+    "return_5": 0.05,
+    "return_20": 0.10,
+    "return_60": 0.09,
+    "return_120": 0.04,
+    "volatility_20": 0.12,
+    "volatility_60": 0.08,
+    "downside_volatility_60": 0.06,
+    "drawdown_60": 0.08,
+    "drawdown_120": 0.06,
+    "price_ma20": 0.06,
+    "price_ma60": 0.06,
+    "volume_ratio": 0.04,
+    "relative_return_20": 0.06,
+    "relative_return_60": 0.04,
+    "benchmark_return_20": 0.03,
+    "benchmark_volatility_20": 0.03,
+}
 
 
 GOAL_PRIORS = {
@@ -1166,6 +1196,415 @@ def calculate_quant_metrics(stock: pd.DataFrame, benchmark: pd.DataFrame) -> dic
     }
 
 
+def _rolling_downside_volatility(returns: pd.Series, window: int) -> pd.Series:
+    def calculate(values: np.ndarray) -> float:
+        downside = values[np.isfinite(values) & (values < 0)]
+        if len(downside) < 5:
+            return np.nan
+        return float(np.std(downside, ddof=1) * np.sqrt(252))
+
+    return returns.rolling(window).apply(calculate, raw=True)
+
+
+def build_analog_feature_frame(stock: pd.DataFrame, benchmark: pd.DataFrame | None) -> tuple[pd.DataFrame, pd.Series]:
+    prices = stock.copy()
+    prices["日期"] = pd.to_datetime(prices["日期"], errors="coerce")
+    prices = prices.dropna(subset=["日期", "收盘"]).drop_duplicates("日期").sort_values("日期")
+    close = pd.to_numeric(prices.set_index("日期")["收盘"], errors="coerce").dropna()
+    volume = pd.to_numeric(prices.set_index("日期")["成交量"], errors="coerce").reindex(close.index)
+    returns = close.pct_change()
+    features = pd.DataFrame(index=close.index)
+
+    for days in (5, 20, 60, 120):
+        features[f"return_{days}"] = close.pct_change(days)
+    features["volatility_20"] = returns.rolling(20).std() * np.sqrt(252)
+    features["volatility_60"] = returns.rolling(60).std() * np.sqrt(252)
+    features["downside_volatility_60"] = _rolling_downside_volatility(returns, 60)
+    features["drawdown_60"] = close / close.rolling(60).max() - 1
+    features["drawdown_120"] = close / close.rolling(120).max() - 1
+    features["price_ma20"] = close / close.rolling(20).mean() - 1
+    features["price_ma60"] = close / close.rolling(60).mean() - 1
+    average_volume_20 = volume.rolling(20).mean()
+    average_volume_60 = volume.rolling(60).mean()
+    features["volume_ratio"] = average_volume_20 / average_volume_60
+
+    benchmark_close = pd.Series(dtype="float64")
+    if benchmark is not None and not benchmark.empty:
+        benchmark_prices = benchmark.copy()
+        benchmark_prices["日期"] = pd.to_datetime(benchmark_prices["日期"], errors="coerce")
+        benchmark_prices = benchmark_prices.dropna(subset=["日期", "收盘"]).drop_duplicates("日期").sort_values("日期")
+        benchmark_close = pd.to_numeric(benchmark_prices.set_index("日期")["收盘"], errors="coerce").dropna()
+        benchmark_close = benchmark_close.reindex(close.index).ffill()
+        benchmark_returns = benchmark_close.pct_change(fill_method=None)
+        features["benchmark_return_20"] = benchmark_close.pct_change(20, fill_method=None)
+        features["benchmark_return_60"] = benchmark_close.pct_change(60, fill_method=None)
+        features["benchmark_volatility_20"] = benchmark_returns.rolling(20).std() * np.sqrt(252)
+        features["relative_return_20"] = features["return_20"] - features["benchmark_return_20"]
+        features["relative_return_60"] = features["return_60"] - features["benchmark_return_60"]
+
+    features = features.replace([np.inf, -np.inf], np.nan)
+    return features, close
+
+
+def _similarity_scores(
+    candidate_features: pd.DataFrame,
+    current_features: pd.Series,
+    weights: dict[str, float],
+) -> pd.Series:
+    if candidate_features.empty:
+        return pd.Series(dtype="float64")
+    columns = [
+        column
+        for column in weights
+        if column in candidate_features.columns
+        and column in current_features.index
+        and np.isfinite(current_features[column])
+    ]
+    if len(columns) < 8:
+        return pd.Series(dtype="float64")
+    candidates = candidate_features[columns].dropna()
+    if candidates.empty:
+        return pd.Series(dtype="float64")
+    first_quartile = candidates.quantile(0.25)
+    third_quartile = candidates.quantile(0.75)
+    scale = third_quartile - first_quartile
+    fallback = candidates.std().replace(0, np.nan)
+    scale = scale.where(scale.abs() > 1e-8, fallback).replace(0, np.nan).fillna(1.0)
+    differences = ((candidates - current_features[columns]) / scale).clip(-8, 8)
+    normalized_weights = pd.Series({column: weights[column] for column in columns}, dtype="float64")
+    normalized_weights = normalized_weights / normalized_weights.sum()
+    distance = np.sqrt(differences.pow(2).mul(normalized_weights, axis=1).sum(axis=1))
+    absolute_similarity = 100 * np.exp(-0.35 * distance)
+    relative_similarity = absolute_similarity.rank(method="average", pct=True) * 100
+    return absolute_similarity * 0.70 + relative_similarity * 0.30
+
+
+def _select_spaced_matches(
+    similarities: pd.Series,
+    date_positions: dict[pd.Timestamp, int],
+    minimum_gap: int,
+    limit: int,
+    minimum_similarity: float,
+) -> list[tuple[pd.Timestamp, int, float]]:
+    selected: list[tuple[pd.Timestamp, int, float]] = []
+    for timestamp, similarity in similarities.sort_values(ascending=False).items():
+        if float(similarity) < minimum_similarity:
+            continue
+        position = date_positions.get(pd.Timestamp(timestamp))
+        if position is None:
+            continue
+        if any(abs(position - existing_position) < minimum_gap for _, existing_position, _ in selected):
+            continue
+        selected.append((pd.Timestamp(timestamp), position, float(similarity)))
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _analog_state_summary(features: pd.DataFrame) -> tuple[dict[str, Any], dict[str, Any]]:
+    current = features.iloc[-1]
+    trend = "震荡"
+    if current.get("return_20", np.nan) > 0 and current.get("price_ma60", np.nan) > 0:
+        trend = "偏强上行"
+    elif current.get("return_20", np.nan) < 0 and current.get("price_ma60", np.nan) < 0:
+        trend = "偏弱下行"
+
+    volatility_series = features["volatility_20"].dropna()
+    volatility_percentile = float((volatility_series <= current.get("volatility_20", np.nan)).mean()) if not volatility_series.empty else np.nan
+    if not np.isfinite(volatility_percentile):
+        volatility_state = "波动数据不足"
+    elif volatility_percentile >= 0.75:
+        volatility_state = "高波动"
+    elif volatility_percentile <= 0.25:
+        volatility_state = "低波动"
+    else:
+        volatility_state = "常态波动"
+
+    drawdown = current.get("drawdown_120", np.nan)
+    if not np.isfinite(drawdown):
+        drawdown_state = "回撤数据不足"
+    elif drawdown <= -0.20:
+        drawdown_state = "深度回撤"
+    elif drawdown <= -0.08:
+        drawdown_state = "中等回撤"
+    else:
+        drawdown_state = "接近阶段高位"
+
+    benchmark_return = current.get("benchmark_return_20", np.nan)
+    if not np.isfinite(benchmark_return):
+        market_state = "市场基准数据不足"
+    elif benchmark_return >= 0.03:
+        market_state = "市场环境偏强"
+    elif benchmark_return <= -0.03:
+        market_state = "市场环境偏弱"
+    else:
+        market_state = "市场环境震荡"
+
+    state = {
+        "trend": trend,
+        "volatility": volatility_state,
+        "drawdown": drawdown_state,
+        "market": market_state,
+        "summary": f"{trend} · {volatility_state} · {drawdown_state} · {market_state}",
+    }
+    display_features = {
+        "近5日收益": current.get("return_5"),
+        "近20日收益": current.get("return_20"),
+        "近60日收益": current.get("return_60"),
+        "20日年化波动": current.get("volatility_20"),
+        "60日年化波动": current.get("volatility_60"),
+        "距120日高点": current.get("drawdown_120"),
+        "20日／60日成交量比": current.get("volume_ratio"),
+        "近20日相对基准": current.get("relative_return_20"),
+        "基准近20日收益": current.get("benchmark_return_20"),
+    }
+    return state, display_features
+
+
+def _walk_forward_analog_backtest(
+    features: pd.DataFrame,
+    close: pd.Series,
+    weights: dict[str, float],
+    horizon: int = 20,
+) -> dict[str, Any]:
+    date_positions = {pd.Timestamp(timestamp): position for position, timestamp in enumerate(close.index)}
+    cases: list[dict[str, Any]] = []
+    start_position = max(360, int(len(close) * 0.35))
+    for evaluation_position in range(start_position, len(close) - horizon, 20):
+        evaluation_date = pd.Timestamp(close.index[evaluation_position])
+        if evaluation_date not in features.index:
+            continue
+        current = features.loc[evaluation_date]
+        last_training_position = evaluation_position - horizon
+        training_dates = close.index[120:last_training_position]
+        training = features.reindex(training_dates)
+        similarities = _similarity_scores(training, current, weights)
+        selected = _select_spaced_matches(similarities, date_positions, 20, 12, 35.0)
+        outcomes: list[float] = []
+        for _, position, _ in selected:
+            if position + horizon >= evaluation_position:
+                continue
+            outcomes.append(float(close.iloc[position + horizon] / close.iloc[position] - 1))
+        if len(outcomes) < 6:
+            continue
+        prediction = float(np.median(outcomes))
+        actual = float(close.iloc[evaluation_position + horizon] / close.iloc[evaluation_position] - 1)
+        momentum = float(close.iloc[evaluation_position] / close.iloc[evaluation_position - horizon] - 1)
+        cases.append(
+            {
+                "date": evaluation_date,
+                "prediction": prediction,
+                "actual": actual,
+                "correct": (prediction >= 0) == (actual >= 0),
+                "momentum_correct": (momentum >= 0) == (actual >= 0),
+                "absolute_error": abs(prediction - actual),
+            }
+        )
+    if not cases:
+        return {"available": False, "cases": 0, "note": "可回测时点不足。"}
+    return {
+        "available": True,
+        "cases": len(cases),
+        "direction_accuracy": float(np.mean([item["correct"] for item in cases])),
+        "momentum_accuracy": float(np.mean([item["momentum_correct"] for item in cases])),
+        "median_absolute_error": float(np.median([item["absolute_error"] for item in cases])),
+        "note": "采用滚动时点验证；每次只使用该时点之前已经可见的数据。",
+    }
+
+
+def analyze_historical_analogs(
+    stock: pd.DataFrame,
+    benchmark: pd.DataFrame | None,
+    history_complete: bool = True,
+    source_label: str = "目标股票",
+) -> dict[str, Any]:
+    features, close = build_analog_feature_frame(stock, benchmark)
+    notes = [
+        "相似周期仅表示历史状态接近，不代表未来一定重复。",
+        "上涨占比是历史样本频率，不是经过校准的真实上涨概率。",
+    ]
+    if len(close) < 360 or features.empty:
+        return {
+            "available": False,
+            "source_label": source_label,
+            "candidate_count": 0,
+            "best_similarity": None,
+            "confidence_score": 0,
+            "confidence_label": "样本不足",
+            "state": {"summary": "历史数据不足，无法识别稳定状态"},
+            "current_features": {},
+            "horizons": [],
+            "matches": [],
+            "backtest": {"available": False, "cases": 0, "note": "至少需要约360个交易日。"},
+            "notes": notes + ["可得交易日不足，未形成相似周期预测。"],
+        }
+
+    state, current_display_features = _analog_state_summary(features)
+    current_date = pd.Timestamp(close.index[-1])
+    current_features = features.loc[current_date]
+    maximum_forward = max(item["days"] for item in ANALOG_HORIZONS)
+    date_positions = {pd.Timestamp(timestamp): position for position, timestamp in enumerate(close.index)}
+    latest_candidate_position = len(close) - maximum_forward - 1
+    candidate_dates = close.index[120 : max(120, latest_candidate_position + 1)]
+    candidate_features = features.reindex(candidate_dates)
+    similarities = _similarity_scores(candidate_features, current_features, ANALOG_FEATURE_WEIGHTS)
+    eligible_similarities = similarities[similarities >= ANALOG_MIN_SIMILARITY]
+
+    global_matches = _select_spaced_matches(
+        eligible_similarities,
+        date_positions,
+        minimum_gap=20,
+        limit=10,
+        minimum_similarity=ANALOG_MIN_SIMILARITY,
+    )
+    match_rows: list[dict[str, Any]] = []
+    for timestamp, position, similarity in global_matches:
+        row: dict[str, Any] = {
+            "start_date": pd.Timestamp(close.index[max(0, position - 59)]),
+            "anchor_date": timestamp,
+            "similarity": similarity,
+        }
+        for config in ANALOG_HORIZONS:
+            days = config["days"]
+            row[f"return_{days}"] = float(close.iloc[position + days] / close.iloc[position] - 1)
+        match_rows.append(row)
+
+    horizon_results: list[dict[str, Any]] = []
+    for config in ANALOG_HORIZONS:
+        days = int(config["days"])
+        selected = _select_spaced_matches(
+            eligible_similarities,
+            date_positions,
+            minimum_gap=int(config["minimum_gap"]),
+            limit=20,
+            minimum_similarity=ANALOG_MIN_SIMILARITY,
+        )
+        outcomes: list[float] = []
+        worst_losses: list[float] = []
+        paths: list[dict[str, Any]] = []
+        similarities_used: list[float] = []
+        for timestamp, position, similarity in selected:
+            if position + days >= len(close):
+                continue
+            entry = float(close.iloc[position])
+            future = close.iloc[position + 1 : position + days + 1]
+            outcome = float(future.iloc[-1] / entry - 1)
+            worst_loss = float(future.min() / entry - 1)
+            outcomes.append(outcome)
+            worst_losses.append(worst_loss)
+            similarities_used.append(similarity)
+            paths.append(
+                {
+                    "anchor_date": timestamp,
+                    "similarity": similarity,
+                    "values": [0.0] + [float(value / entry - 1) for value in future.tolist()],
+                }
+            )
+        sample_count = len(outcomes)
+        available = sample_count >= ANALOG_MIN_SAMPLES
+        if available:
+            positive_ratio = float(np.mean(np.asarray(outcomes) > 0))
+            median_return = float(np.median(outcomes))
+            if positive_ratio >= 0.65 and median_return > 0:
+                direction = "历史情景偏正面"
+            elif positive_ratio <= 0.35 and median_return < 0:
+                direction = "历史情景偏负面"
+            else:
+                direction = "历史情景分歧／中性"
+            average_similarity = float(np.mean(similarities_used))
+            horizon_confidence = int(
+                np.clip(
+                    min(sample_count / 15, 1.0) * 50
+                    + np.clip((average_similarity - ANALOG_MIN_SIMILARITY) / 20, 0, 1) * 35
+                    + (10 if history_complete else 0),
+                    0,
+                    95,
+                )
+            )
+            if not history_complete:
+                horizon_confidence = max(0, horizon_confidence - 20)
+            horizon_results.append(
+                {
+                    **config,
+                    "available": True,
+                    "sample_count": sample_count,
+                    "positive_ratio": positive_ratio,
+                    "median_return": median_return,
+                    "q10_return": float(np.quantile(outcomes, 0.10)),
+                    "q25_return": float(np.quantile(outcomes, 0.25)),
+                    "q75_return": float(np.quantile(outcomes, 0.75)),
+                    "median_worst_loss": float(np.median(worst_losses)),
+                    "average_similarity": average_similarity,
+                    "confidence_score": horizon_confidence,
+                    "direction": direction,
+                    "outcomes": outcomes,
+                    "paths": paths,
+                }
+            )
+        else:
+            horizon_results.append(
+                {
+                    **config,
+                    "available": False,
+                    "sample_count": sample_count,
+                    "positive_ratio": None,
+                    "median_return": None,
+                    "q10_return": None,
+                    "q25_return": None,
+                    "q75_return": None,
+                    "median_worst_loss": None,
+                    "average_similarity": float(np.mean(similarities_used)) if similarities_used else None,
+                    "confidence_score": 0,
+                    "direction": "样本不足，不形成预测",
+                    "outcomes": [],
+                    "paths": [],
+                }
+            )
+
+    backtest = _walk_forward_analog_backtest(features, close, ANALOG_FEATURE_WEIGHTS, horizon=20)
+    available_horizons = [item for item in horizon_results if item["available"]]
+    if available_horizons:
+        if backtest.get("available") and backtest.get("cases", 0) >= 10:
+            accuracy = float(backtest["direction_accuracy"])
+            backtest_factor = float(np.clip((accuracy - 0.35) / 0.30, 0.25, 1.0))
+            multiplier = 0.45 + 0.55 * backtest_factor
+            for item in available_horizons:
+                adjusted = float(item["confidence_score"]) * multiplier
+                if accuracy + 0.03 < float(backtest.get("momentum_accuracy", accuracy)):
+                    adjusted -= 5
+                item["confidence_score"] = int(np.clip(round(adjusted), 0, 95))
+        else:
+            for item in available_horizons:
+                item["confidence_score"] = min(int(item["confidence_score"]), 65)
+        confidence_score = float(np.mean([item["confidence_score"] for item in available_horizons]))
+        confidence_score = int(np.clip(round(confidence_score), 0, 100))
+        confidence_label = "较高" if confidence_score >= 75 else "中等" if confidence_score >= 55 else "较低"
+    else:
+        confidence_score = 0
+        confidence_label = "样本不足"
+    if not history_complete:
+        notes.append("该标的上市不足五年或数据覆盖不完整，已下调相似周期可信度。")
+    if not available_horizons:
+        notes.append("有效相似样本少于最低要求，Agent拒绝形成方向预测。")
+
+    best_similarity = float(eligible_similarities.max()) if not eligible_similarities.empty else None
+    return {
+        "available": bool(available_horizons),
+        "source_label": source_label,
+        "candidate_count": int(len(similarities)),
+        "eligible_candidate_count": int(len(eligible_similarities)),
+        "best_similarity": best_similarity,
+        "confidence_score": confidence_score,
+        "confidence_label": confidence_label,
+        "state": state,
+        "current_features": current_display_features,
+        "horizons": horizon_results,
+        "matches": match_rows,
+        "backtest": backtest,
+        "notes": notes,
+    }
+
+
 def score_stock_risk(metrics: dict[str, Any]) -> tuple[int, int, str, list[str]]:
     volatility = metrics["annual_volatility"]
     max_drawdown = abs(metrics["max_drawdown"])
@@ -1244,6 +1683,7 @@ def score_horizons(
     metrics: dict[str, Any],
     fundamental: EvidenceSnapshot,
     macro: EvidenceSnapshot,
+    analog_forecast: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     close: pd.Series = metrics["close"]
     benchmark_close: pd.Series = metrics["benchmark_close"]
@@ -1293,6 +1733,36 @@ def score_horizons(
         if fundamental.score is not None:
             score += (fundamental.score - 50) * fundamental_weight
             reasons.append("基本面评分提供支持" if fundamental.score >= 55 else "基本面评分未形成明显支持")
+        analog_adjustment = 0.0
+        analog_evidence = None
+        if analog_forecast:
+            analog_evidence = next(
+                (
+                    item
+                    for item in analog_forecast.get("horizons", [])
+                    if int(item.get("days", -1)) == int(config["days"]) and item.get("available")
+                ),
+                None,
+            )
+        analog_used = False
+        if analog_evidence and int(analog_evidence.get("confidence_score", 0)) >= ANALOG_SCORE_MIN_CONFIDENCE:
+            positive_ratio = float(analog_evidence["positive_ratio"])
+            median_return = float(analog_evidence["median_return"])
+            expected_scale = 0.015 * np.sqrt(max(float(config["days"]), 5.0) / 5.0)
+            raw_adjustment = (positive_ratio - 0.50) * 20
+            raw_adjustment += float(np.clip(median_return / expected_scale, -1, 1) * 4)
+            if float(analog_evidence["q10_return"]) < -0.15:
+                raw_adjustment -= 1.5
+            confidence_weight = 0.45 + 0.55 * float(analog_evidence["confidence_score"]) / 100
+            analog_adjustment = float(np.clip(raw_adjustment * confidence_weight, -8, 8))
+            score += analog_adjustment
+            analog_used = True
+            reasons.append(
+                f"{analog_evidence['sample_count']}个相似周期后历史上涨占比{positive_ratio:.0%}，"
+                f"中位收益{median_return:.1%}"
+            )
+        elif analog_evidence:
+            reasons.append("相似周期历史回测可信度不足，已展示但未参与评分")
         score_int = int(round(np.clip(score, 0, 100)))
         label = "条件较积极" if score_int >= 68 else "中性偏积极" if score_int >= 56 else "中性观察" if score_int >= 42 else "偏弱／暂缓"
         stress_returns = close.pct_change(config["days"]).dropna()
@@ -1308,6 +1778,9 @@ def score_horizons(
                 "benchmark_return": benchmark_return,
                 "stress_loss": stress_loss,
                 "historical_worst": historical_worst,
+                "analog_adjustment": analog_adjustment,
+                "analog_evidence": analog_evidence,
+                "analog_used": analog_used,
                 "reasons": reasons,
             }
         )
@@ -1486,12 +1959,57 @@ def analyze_all(
     metrics["benchmark_available"] = bundle.benchmark is not None and not bundle.benchmark.empty
     investor_score, investor_number, investor_level, style, profile_flags = score_investor(profile)
     stock_risk_score, stock_risk_number, stock_risk_level, risk_reasons = score_stock_risk(metrics)
-    horizon_scores = score_horizons(metrics, fundamental, macro)
+    analog_forecast = analyze_historical_analogs(
+        bundle.stock,
+        bundle.benchmark,
+        history_complete=bundle.history_complete,
+        source_label="目标股票（结合市场状态）",
+    )
+    analog_forecast["notes"].append(
+        "本版使用目标股票自身历史，并把市场基准状态纳入相似度；未取得稳定行业指数时，不用无关股票冒充行业样本。"
+    )
+    if bundle.benchmark is not None and not bundle.benchmark.empty:
+        market_analog_forecast = analyze_historical_analogs(
+            bundle.benchmark,
+            None,
+            history_complete=len(bundle.benchmark) >= 1000,
+            source_label=bundle.benchmark_name,
+        )
+    else:
+        market_analog_forecast = {
+            "available": False,
+            "source_label": bundle.benchmark_name,
+            "confidence_label": "基准数据不足",
+            "horizons": [],
+            "matches": [],
+            "notes": ["市场基准未返回足够数据，无法单独检索市场相似周期。"],
+        }
+    horizon_scores = score_horizons(metrics, fundamental, macro, analog_forecast)
     selected_horizon, horizon_notes = choose_horizon(horizon_scores, profile)
     confidence, confidence_notes = calculate_data_confidence(metrics, fundamental, macro, bundle.asset_type)
+    if not analog_forecast["available"]:
+        confidence_notes.append("相似周期样本不足，相关情景预测未参与结论。")
     suitability_result = assess_suitability(profile, investor_number, stock_risk_number, selected_horizon, confidence)
     position = position_budget(profile, investor_number, stock_risk_number, suitability_result, selected_horizon)
     conclusion, conclusion_reason = build_final_conclusion(suitability_result, selected_horizon, position)
+    selected_analog = None
+    if selected_horizon:
+        selected_analog = next(
+            (
+                item
+                for item in analog_forecast.get("horizons", [])
+                if item.get("available")
+                and int(item.get("confidence_score", 0)) >= ANALOG_SCORE_MIN_CONFIDENCE
+                and int(item.get("days", -1)) == int(selected_horizon["days"])
+            ),
+            None,
+        )
+    if selected_analog:
+        conclusion_reason += (
+            f" 相似历史状态后{selected_analog['days']}个交易日上涨样本占比"
+            f"{selected_analog['positive_ratio']:.0%}，中位收益{selected_analog['median_return']:.1%}；"
+            "该频率不等于确定概率。"
+        )
     return {
         "metrics": metrics,
         "investor_score": investor_score,
@@ -1514,4 +2032,6 @@ def analyze_all(
         "conclusion_reason": conclusion_reason,
         "fundamental": fundamental,
         "macro": macro,
+        "analog_forecast": analog_forecast,
+        "market_analog_forecast": market_analog_forecast,
     }

@@ -31,7 +31,7 @@ from questionnaire import (
 
 
 st.set_page_config(
-    page_title="个人投资者股票决策辅助 Agent 简化版",
+    page_title="个人投资者股票决策辅助 Agent V5.3",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -194,8 +194,8 @@ def load_current_user_data() -> None:
 
 def render_brand(subtitle: str = "") -> None:
     st.markdown('<div class="app-brand">Five-year evidence · Personal suitability</div>', unsafe_allow_html=True)
-    st.title("个人投资者股票决策辅助 Agent｜简化部署版 V5.2")
-    st.caption(subtitle or "近五年真实公开行情 · 当前会话风险测评 · 多周期风险判断 · 教学研究原型")
+    st.title("个人投资者股票决策辅助 Agent｜相似周期预测版 V5.3")
+    st.caption(subtitle or "近五年真实公开行情 · 历史相似状态检索 · 个人风险适配 · 教学研究原型")
 
 
 def question_option_label(option: str, current: str | None) -> str:
@@ -288,7 +288,7 @@ def analysis_home() -> None:
     risk_cols[0].metric("个人风险等级", record.get("risk_level", "—"), f"{record.get('risk_score', '—')}/100")
     risk_cols[1].metric("测评版本", f"第 {record.get('version', 1)} 版")
     risk_cols[2].metric("资产范围", profile.get("asset_band", "—"))
-    st.markdown('<div class="hero-card"><b>选择本次要分析的股票</b><br><span class="muted">Agent统一使用最近五年行情；上市不足五年时使用全部可得数据并降低结论置信度。</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero-card"><b>选择本次要分析的股票</b><br><span class="muted">Agent统一使用最近五年行情，识别当前波动状态并检索历史相似周期；上市不足五年时使用全部可得数据并降低结论置信度。</span></div>', unsafe_allow_html=True)
     st.caption("提示：本版不注册账号。关闭网页、清除浏览器数据或更换设备后，需要重新完成风险测评。")
 
     stock_left, stock_right = st.columns([1, 1])
@@ -492,7 +492,7 @@ def app_sidebar() -> None:
             st.session_state.view = "profile"
             st.rerun()
         st.divider()
-        st.caption("行情统一使用最近五年；新股使用上市以来全部可得数据并标注低置信度。")
+        st.caption("行情统一使用最近五年；相似样本不足时拒绝预测；新股标注低置信度。")
 
 
 def pct(value: float | None, digits: int = 1) -> str:
@@ -563,6 +563,38 @@ def render_summary(bundle, analysis, profile) -> None:
     columns[2].metric("股票风险等级", analysis["stock_risk_level"], f"{analysis['stock_risk_score']}/100")
     columns[3].metric("个人适配", analysis["suitability"]["fit"])
     columns[4].metric("数据完整度", f"{analysis['data_confidence']}%")
+
+    analog = analysis.get("analog_forecast") or {}
+    st.markdown("#### 历史相似状态情景")
+    analog_cols = st.columns([1.6, 1, 1])
+    analog_cols[0].metric("当前状态", analog.get("state", {}).get("summary", "无法识别"))
+    analog_cols[1].metric(
+        "相似周期可信度",
+        analog.get("confidence_label", "样本不足"),
+        f"{analog.get('confidence_score', 0)}/100",
+    )
+    best_similarity = analog.get("best_similarity")
+    analog_cols[2].metric("最高相似度", f"{best_similarity:.0f}/100" if best_similarity is not None else "无有效样本")
+    selected_analog = None
+    if selected:
+        selected_analog = next(
+            (
+                item
+                for item in analog.get("horizons", [])
+                if item.get("available") and int(item.get("days", -1)) == int(selected["days"])
+            ),
+            None,
+        )
+    if selected_analog:
+        st.info(
+            f"与当前状态相似的{selected_analog['sample_count']}个历史样本中，随后"
+            f"{selected_analog['days']}个交易日上涨样本占比为{selected_analog['positive_ratio']:.0%}，"
+            f"收益中位数{selected_analog['median_return']:.1%}，"
+            f"中间50%区间{selected_analog['q25_return']:.1%}至{selected_analog['q75_return']:.1%}。"
+        )
+    elif not analog.get("available"):
+        st.warning("有效相似样本不足，Agent没有生成方向预测；其他风险分析仍可继续查看。")
+    st.caption("这里展示的是历史样本频率和情景分布，不是确定上涨概率，也不是收益承诺。")
 
     left, right = st.columns(2)
     with left:
@@ -706,6 +738,11 @@ def render_horizons(analysis) -> None:
             {
                 "周期": item["name"],
                 "当前时点评分": f"{item['score']}/100" if item["score"] is not None else "—",
+                "相似周期修正": (
+                    f"{item.get('analog_adjustment', 0):+.1f}分"
+                    if item.get("analog_used")
+                    else "可信度不足" if item.get("analog_evidence") is not None else "无有效样本"
+                ),
                 "状态": item["label"],
                 "是否选中": "✓" if item["name"] == selected_name else "",
             }
@@ -721,6 +758,163 @@ def render_horizons(analysis) -> None:
         fig.update_layout(height=360, yaxis_range=[0, 100], yaxis_title="当前时点评分", margin=dict(l=20, r=20, t=20, b=20))
         st.plotly_chart(fig, width="stretch")
     st.warning("1个交易日需要分钟级或实时行情、交易成本与盘口信息。本版只有公开日线，因此会显示该周期但不会假装给出可靠次日预测。")
+
+
+def analog_horizon_rows(forecast: dict) -> list[dict]:
+    rows: list[dict] = []
+    for item in forecast.get("horizons", []):
+        rows.append(
+            {
+                "观察期限": f"后续{item['days']}个交易日",
+                "有效样本": item.get("sample_count", 0),
+                "历史上涨样本占比": pct(item.get("positive_ratio")) if item.get("available") else "样本不足",
+                "收益中位数": pct(item.get("median_return")) if item.get("available") else "—",
+                "中间50%区间": (
+                    f"{pct(item.get('q25_return'))} 至 {pct(item.get('q75_return'))}"
+                    if item.get("available")
+                    else "—"
+                ),
+                "10%较差分位": pct(item.get("q10_return")) if item.get("available") else "—",
+                "期间最深浮亏中位数": pct(item.get("median_worst_loss")) if item.get("available") else "—",
+                "情景判断": item.get("direction", "—"),
+                "可信度": f"{item.get('confidence_score', 0)}/100" if item.get("available") else "—",
+            }
+        )
+    return rows
+
+
+def render_analog_forecast(analysis) -> None:
+    forecast = analysis.get("analog_forecast") or {}
+    st.subheader("历史相似周期与未来情景预测")
+    st.info(
+        "Agent先识别当前趋势、波动、回撤、成交量、相对基准和市场状态，再从最近五年中寻找相似且尽量分散的历史窗口，统计这些窗口之后的实际表现。"
+    )
+    state_cols = st.columns(4)
+    state = forecast.get("state", {})
+    state_cols[0].metric("趋势状态", state.get("trend", "数据不足"))
+    state_cols[1].metric("波动状态", state.get("volatility", "数据不足"))
+    state_cols[2].metric("回撤状态", state.get("drawdown", "数据不足"))
+    state_cols[3].metric("市场状态", state.get("market", "数据不足"))
+
+    current_features = forecast.get("current_features") or {}
+    if current_features:
+        feature_rows = []
+        for name, value in current_features.items():
+            display = number(value) if "成交量比" in name else pct(value)
+            feature_rows.append([name, display])
+        with st.expander("查看Agent用于匹配的当前状态特征"):
+            st.dataframe(pd.DataFrame(feature_rows, columns=["当前特征", "数值"]), hide_index=True, width="stretch")
+
+    rows = analog_horizon_rows(forecast)
+    if rows:
+        st.markdown("#### 不同期限的历史后续表现")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    if not forecast.get("available"):
+        st.warning("有效相似周期少于最低样本要求，Agent拒绝形成方向预测。")
+
+    available_horizons = [item for item in forecast.get("horizons", []) if item.get("available")]
+    if available_horizons:
+        distribution = go.Figure()
+        for item in available_horizons:
+            distribution.add_trace(
+                go.Box(
+                    y=item["outcomes"],
+                    name=f"{item['days']}日",
+                    boxpoints="outliers",
+                    marker_color="#2563eb",
+                )
+            )
+        distribution.add_hline(y=0, line_dash="dot", line_color="#667085")
+        distribution.update_layout(
+            title="相似周期后续收益分布",
+            height=390,
+            yaxis_tickformat=".0%",
+            yaxis_title="从相似时点开始计算的后续收益",
+            margin=dict(l=20, r=20, t=55, b=20),
+            showlegend=False,
+        )
+        st.plotly_chart(distribution, width="stretch")
+
+        selected_days = analysis.get("selected_horizon", {}).get("days") if analysis.get("selected_horizon") else None
+        path_horizon = next((item for item in available_horizons if item["days"] == selected_days), available_horizons[0])
+        path_figure = go.Figure()
+        sorted_paths = sorted(path_horizon.get("paths", []), key=lambda item: item["similarity"], reverse=True)[:6]
+        for path in sorted_paths:
+            path_figure.add_trace(
+                go.Scatter(
+                    x=list(range(len(path["values"]))),
+                    y=path["values"],
+                    mode="lines",
+                    line=dict(width=1.2),
+                    opacity=0.42,
+                    name=f"{pd.Timestamp(path['anchor_date']).date()} · {path['similarity']:.0f}",
+                )
+            )
+        if sorted_paths:
+            median_path = pd.DataFrame([path["values"] for path in sorted_paths]).median(axis=0)
+            path_figure.add_trace(
+                go.Scatter(
+                    x=list(range(len(median_path))),
+                    y=median_path,
+                    mode="lines",
+                    line=dict(width=4, color="#dc2626"),
+                    name="相似路径中位数",
+                )
+            )
+        path_figure.add_hline(y=0, line_dash="dot", line_color="#667085")
+        path_figure.update_layout(
+            title=f"最高相似样本之后{path_horizon['days']}个交易日的标准化路径",
+            height=410,
+            xaxis_title="后续交易日",
+            yaxis_title="相对相似时点的收益",
+            yaxis_tickformat=".0%",
+            margin=dict(l=20, r=20, t=55, b=20),
+        )
+        st.plotly_chart(path_figure, width="stretch")
+
+    matches = forecast.get("matches") or []
+    if matches:
+        st.markdown("#### 最相似的历史窗口")
+        match_rows = []
+        for item in matches:
+            match_rows.append(
+                {
+                    "状态观察起点": str(pd.Timestamp(item["start_date"]).date()),
+                    "相似时点": str(pd.Timestamp(item["anchor_date"]).date()),
+                    "相似度": f"{item['similarity']:.0f}/100",
+                    "随后5日": pct(item.get("return_5")),
+                    "随后20日": pct(item.get("return_20")),
+                    "随后60日": pct(item.get("return_60")),
+                    "随后120日": pct(item.get("return_120")),
+                }
+            )
+        st.dataframe(pd.DataFrame(match_rows), hide_index=True, width="stretch")
+
+    backtest = forecast.get("backtest") or {}
+    st.markdown("#### 滚动回测检查")
+    if backtest.get("available"):
+        backtest_cols = st.columns(3)
+        backtest_cols[0].metric("历史验证时点", f"{backtest['cases']}个")
+        backtest_cols[1].metric("20日方向一致率", pct(backtest["direction_accuracy"]))
+        backtest_cols[2].metric("预测中位数绝对误差", pct(backtest["median_absolute_error"]))
+        st.caption(
+            f"同期简单动量方向一致率：{pct(backtest['momentum_accuracy'])}。{backtest['note']}"
+            "回测结果仅用于检验规则，不能保证未来表现。"
+        )
+    else:
+        st.warning(backtest.get("note", "可回测时点不足。"))
+
+    market_forecast = analysis.get("market_analog_forecast") or {}
+    with st.expander(f"查看市场基准相似周期｜{market_forecast.get('source_label', '市场基准')}"):
+        market_rows = analog_horizon_rows(market_forecast)
+        if market_rows:
+            st.dataframe(pd.DataFrame(market_rows), hide_index=True, width="stretch")
+        else:
+            st.info("市场基准没有足够的相似周期样本。")
+
+    for note in forecast.get("notes", []):
+        st.caption(f"• {note}")
+    st.warning("相似周期预测是一种历史情景分析，不等于未来会复制历史路径，也不能代替对公司基本面和重大事件的判断。")
 
 
 def render_evidence(bundle, analysis) -> None:
@@ -776,10 +970,13 @@ def render_professional(bundle, analysis) -> None:
             """
             - 用户风险等级与用户类型分开：经验丰富不自动等于风险承受能力高。
             - 股票风险分综合近一年波动、下行波动、全部历史回撤和Beta；最大回撤不会单独否决。
-            - 当前时点分按不同周期分别计算，使用均线结构、动量、相对基准、成交量、基本面和市场环境。
+            - 当前时点分按不同周期分别计算，使用均线结构、动量、相对基准、成交量、基本面、市场环境和相似周期后续分布。
+            - 相似周期检索使用收益、波动、回撤、均线位置、成交量和市场基准特征；有效样本少于10个时拒绝形成预测。
+            - 相似周期最多只对当前时点评分进行有限修正，不会覆盖个人适配、安全限制或数据不足结论。
+            - 20日滚动回测的每个验证时点只使用当时已经可见的数据，用于检查规则是否存在明显失效。
             - Agent在资金最早使用时间允许的范围内，结合投资目标、看盘条件和退出纪律选择周期。
             - 仓位是风险预算参考值，不是收益承诺，也不等于下单指令。
-            - 语言模型没有直接编造价格或评分；所有数值由可检查的量化规则计算。
+            - 历史上涨样本占比不等于经过校准的真实上涨概率；所有数值由可检查的量化规则计算。
             """
         )
 
@@ -788,7 +985,7 @@ def page_three() -> None:
     confirmed_market, confirmed_code = ensure_confirmed_stock()
     profile = dict(st.session_state.profile)
     render_brand(f"正在分析 {confirmed_market}｜{confirmed_code}")
-    st.subheader(f"Agent自动获取 {confirmed_code} 近五年数据并分析")
+    st.subheader(f"Agent自动获取 {confirmed_code} 近五年数据、检索相似周期并分析")
     with st.status("正在完成自动分析……", expanded=True) as status:
         try:
             status.write("1/4 获取股票最近五年或上市以来全部可得行情")
@@ -833,7 +1030,7 @@ def page_three() -> None:
                 bundle.name = str(company_name)
             status.write("3/4 识别市场与宏观环境")
             macro = cached_macro(confirmed_market, bundle.benchmark)
-            status.write("4/4 计算多周期信号、适配程度和风险预算")
+            status.write("4/4 检索历史相似周期，计算多周期信号、个人适配和风险预算")
             analysis = analyze_all(bundle, profile, fundamental, macro)
             current_holding = float(profile.get("current_holding_value") or 0.0)
             assets = float(profile.get("investable_assets") or 0.0)
@@ -879,20 +1076,22 @@ def page_three() -> None:
             st.info(warning)
 
     view_mode = st.radio("结果显示", ["简明模式", "专业模式"], horizontal=True, help="两种模式使用同一套计算结果，只改变解释深度。")
-    tab_names = ["结论", "风险与仓位", "持有周期", "数据证据"]
+    tab_names = ["结论", "相似周期预测", "风险与仓位", "持有周期", "数据证据"]
     if view_mode == "专业模式":
         tab_names.append("专业指标")
     tabs = st.tabs(tab_names)
     with tabs[0]:
         render_summary(bundle, analysis, profile)
     with tabs[1]:
-        render_risk_budget(analysis, profile)
+        render_analog_forecast(analysis)
     with tabs[2]:
-        render_horizons(analysis)
+        render_risk_budget(analysis, profile)
     with tabs[3]:
+        render_horizons(analysis)
+    with tabs[4]:
         render_evidence(bundle, analysis)
     if view_mode == "专业模式":
-        with tabs[4]:
+        with tabs[5]:
             render_professional(bundle, analysis)
 
     st.divider()
