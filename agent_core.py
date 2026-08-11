@@ -28,8 +28,8 @@ except ImportError:
 
 
 HISTORY_YEARS = 5
-HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 StockResearchAgent/5.3"}
-SEC_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "IndividualInvestorResearchAgent/5.3 educational-use")}
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 StockResearchAgent/5.5"}
+SEC_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "IndividualInvestorResearchAgent/5.5 educational-use")}
 
 
 HORIZONS: list[dict[str, Any]] = [
@@ -182,6 +182,7 @@ def calculate_holding_values(
     latest_price: float,
     cost_price: float | None = None,
     usd_cny_rate: float | None = None,
+    hkd_cny_rate: float | None = None,
 ) -> dict[str, Any]:
     share_count = float(shares)
     price = float(latest_price)
@@ -189,15 +190,25 @@ def calculate_holding_values(
         raise ValueError("持股数量必须大于0。")
     if price <= 0:
         raise ValueError("最新公开价格无效，暂时无法计算持仓市值。")
-    if market not in {"A股", "美股"}:
+    if market not in {"A股", "美股", "港股"}:
         raise ValueError("暂不支持该市场的持仓换算。")
 
     current_native = share_count * price
     rate = 1.0
+    native_currency = "人民币元"
+    fx_pair = None
     if market == "美股":
         rate = float(usd_cny_rate or 0.0)
         if rate <= 0:
             raise ValueError("美元兑人民币汇率暂不可用，请改用“按持仓金额填写”。")
+        native_currency = "美元"
+        fx_pair = "美元兑人民币"
+    elif market == "港股":
+        rate = float(hkd_cny_rate or 0.0)
+        if rate <= 0:
+            raise ValueError("港元兑人民币汇率暂不可用，请改用“按持仓金额填写”。")
+        native_currency = "港元"
+        fx_pair = "港元兑人民币"
     current_rmb = current_native * rate
 
     parsed_cost = float(cost_price or 0.0)
@@ -208,7 +219,7 @@ def calculate_holding_values(
         "method": "按持股数量填写",
         "shares": share_count,
         "latest_price": price,
-        "native_currency": "人民币元" if market == "A股" else "美元",
+        "native_currency": native_currency,
         "current_native": current_native,
         "current_rmb": current_rmb,
         "cost_price": parsed_cost if parsed_cost > 0 else None,
@@ -218,6 +229,9 @@ def calculate_holding_values(
         "profit_rmb": profit_native * rate if profit_native is not None else None,
         "return_rate": return_rate,
         "usd_cny_rate": rate if market == "美股" else None,
+        "hkd_cny_rate": rate if market == "港股" else None,
+        "fx_rate": rate if market in {"美股", "港股"} else None,
+        "fx_pair": fx_pair,
     }
 
 
@@ -263,6 +277,22 @@ def normalize_us_code(raw_code: str) -> str:
     if not code or len(code) > 15 or not all(char.isalnum() or char in ".-" for char in code):
         raise ValueError("请输入有效美股代码，例如AAPL、MSFT、NVDA或BRK-B。")
     return code
+
+
+def normalize_hk_code(raw_code: str) -> str:
+    code = raw_code.strip().upper().replace(" ", "")
+    if code.endswith(".HK"):
+        code = code[:-3]
+    if not code or not code.isdigit() or len(code) > 5 or int(code) <= 0:
+        raise ValueError("港股代码应为1至5位数字，例如00700、09988；也可以输入700或0700.HK。")
+    return code.zfill(5)
+
+
+def hk_yahoo_ticker(code: str) -> str:
+    normalized = normalize_hk_code(code)
+    numeric = str(int(normalized))
+    yahoo_code = numeric.zfill(4) if len(numeric) < 4 else numeric
+    return f"{yahoo_code}.HK"
 
 
 def is_exchange_traded_fund_code(code: str) -> bool:
@@ -535,6 +565,82 @@ def fetch_usd_cny_rate() -> dict[str, Any]:
     return max(valid, key=lambda item: pd.Timestamp(item["date"]))
 
 
+def _fetch_fred_latest_value(series_id: str) -> tuple[float, pd.Timestamp]:
+    response = _get_with_retry(
+        "https://fred.stlouisfed.org/graph/fredgraph.csv",
+        params={"id": series_id},
+        timeout=20,
+    )
+    raw = pd.read_csv(StringIO(response.text))
+    date_column = next((column for column in raw.columns if "date" in str(column).lower()), None)
+    value_column = next((column for column in raw.columns if str(column).upper() == series_id.upper()), None)
+    if not date_column or not value_column:
+        raise RuntimeError(f"FRED没有返回{series_id}所需字段。")
+    values = raw[[date_column, value_column]].copy()
+    values[date_column] = pd.to_datetime(values[date_column], errors="coerce")
+    values[value_column] = pd.to_numeric(values[value_column], errors="coerce")
+    values = values.dropna().sort_values(date_column)
+    if values.empty:
+        raise RuntimeError(f"FRED没有返回{series_id}有效数值。")
+    latest = values.iloc[-1]
+    return float(latest[value_column]), pd.Timestamp(latest[date_column])
+
+
+def fetch_hkd_cny_rate() -> dict[str, Any]:
+    end_text = date.today().strftime("%Y-%m-%d")
+    start_text = (pd.Timestamp(end_text) - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
+    errors: list[str] = []
+    candidates: list[dict[str, Any]] = []
+
+    try:
+        data, _ = fetch_yahoo_chart_history("HKDCNY=X", start_text, end_text)
+        if not data.empty:
+            latest = data.iloc[-1]
+            candidates.append(
+                {
+                    "rate": float(latest["收盘"]),
+                    "date": pd.Timestamp(latest["日期"]),
+                    "provider": "Yahoo Finance港元兑人民币公开日线（HKDCNY=X）",
+                }
+            )
+    except Exception as exc:
+        errors.append(f"Yahoo图表接口：{exc}")
+
+    try:
+        data = fetch_yfinance_history("HKDCNY=X", start_text, end_text)
+        if not data.empty:
+            latest = data.iloc[-1]
+            candidates.append(
+                {
+                    "rate": float(latest["收盘"]),
+                    "date": pd.Timestamp(latest["日期"]),
+                    "provider": "yfinance港元兑人民币备用日线（HKDCNY=X）",
+                }
+            )
+    except Exception as exc:
+        errors.append(f"yfinance：{exc}")
+
+    try:
+        cny_per_usd, cny_date = _fetch_fred_latest_value("DEXCHUS")
+        hkd_per_usd, hkd_date = _fetch_fred_latest_value("DEXHKUS")
+        if hkd_per_usd > 0:
+            candidates.append(
+                {
+                    "rate": cny_per_usd / hkd_per_usd,
+                    "date": min(cny_date, hkd_date),
+                    "provider": "美国FRED交叉汇率（DEXCHUS÷DEXHKUS）",
+                }
+            )
+    except Exception as exc:
+        errors.append(f"FRED交叉汇率：{exc}")
+
+    valid = [item for item in candidates if 0.5 <= float(item["rate"]) <= 1.5]
+    if not valid:
+        detail = "；".join(errors) if errors else "公开接口没有返回有效汇率"
+        raise RuntimeError(f"港元兑人民币汇率获取失败。{detail}")
+    return max(valid, key=lambda item: pd.Timestamp(item["date"]))
+
+
 def fetch_akshare_us_history(symbol: str, start_text: str, end_text: str) -> tuple[pd.DataFrame, str]:
     if ak is None:
         return pd.DataFrame(), ""
@@ -599,6 +705,59 @@ def fetch_us_security(symbol: str, start_text: str, end_text: str) -> tuple[pd.D
         return max(candidates, key=_candidate_quality)
     detail = "；".join(errors) if errors else "相关组件未安装或接口无数据"
     raise RuntimeError(f"美股数据通道均未返回有效数据。{detail}")
+
+
+def fetch_hk_security(code: str, start_text: str, end_text: str) -> tuple[pd.DataFrame, str, str]:
+    normalized = normalize_hk_code(code)
+    yahoo_symbol = hk_yahoo_ticker(normalized)
+    candidates: list[tuple[pd.DataFrame, str, str]] = []
+    errors: list[str] = []
+    resolved_name = normalized
+
+    if ak is not None:
+        try:
+            raw = ak.stock_hk_hist(
+                symbol=normalized,
+                period="daily",
+                start_date=start_text.replace("-", ""),
+                end_date=end_text.replace("-", ""),
+                adjust="qfq",
+            )
+            data = standardize_chinese_ohlcv(raw)
+            if not data.empty:
+                candidates.append((data, normalized, "AKShare／东方财富港股公开行情（前复权日线）"))
+        except Exception as exc:
+            errors.append(f"AKShare／东方财富：{exc}")
+
+    try:
+        data, yahoo_name = fetch_yahoo_chart_history(yahoo_symbol, start_text, end_text)
+        if not data.empty:
+            resolved_name = yahoo_name or normalized
+            candidates.append((data, resolved_name, f"Yahoo Finance港股图表公开接口（{yahoo_symbol}，复权日线）"))
+    except Exception as exc:
+        errors.append(f"Yahoo图表接口：{exc}")
+
+    try:
+        data = fetch_yfinance_history(yahoo_symbol, start_text, end_text)
+        if not data.empty:
+            candidates.append((data, resolved_name, f"yfinance港股备用行情（{yahoo_symbol}，自动复权）"))
+    except Exception as exc:
+        errors.append(f"yfinance备用：{exc}")
+
+    if ak is not None:
+        try:
+            raw = ak.stock_hk_daily(symbol=normalized, adjust="qfq")
+            data = filter_dates(standardize_english_ohlcv(raw), start_text, end_text)
+            if not data.empty:
+                candidates.append((data, resolved_name, "AKShare／新浪港股备用行情（前复权日线）"))
+        except Exception as exc:
+            errors.append(f"AKShare／新浪：{exc}")
+
+    if candidates:
+        best = max(candidates, key=_candidate_quality)
+        return best[0], resolved_name if resolved_name != normalized else best[1], best[2]
+    detail = "；".join(errors) if errors else "相关组件未安装或接口无数据"
+    raise RuntimeError(f"港股数据通道均未返回有效数据。{detail}")
 
 
 def _fetch_sina_fund(code: str, start_text: str, end_text: str) -> pd.DataFrame:
@@ -737,6 +896,34 @@ def fetch_us_benchmark(start_text: str, end_text: str) -> pd.DataFrame:
     if not candidates:
         raise RuntimeError("标普500代理基准SPY获取失败。")
     return max(candidates, key=len)
+
+
+def fetch_hk_benchmark(start_text: str, end_text: str) -> pd.DataFrame:
+    candidates: list[pd.DataFrame] = []
+    errors: list[str] = []
+    try:
+        data, _ = fetch_yahoo_chart_history("^HSI", start_text, end_text)
+        if not data.empty:
+            candidates.append(data)
+    except Exception as exc:
+        errors.append(f"Yahoo恒生指数：{exc}")
+    try:
+        data = fetch_yfinance_history("^HSI", start_text, end_text)
+        if not data.empty:
+            candidates.append(data)
+    except Exception as exc:
+        errors.append(f"yfinance恒生指数：{exc}")
+    if ak is not None:
+        try:
+            raw = ak.stock_hk_index_daily_sina(symbol="HSI")
+            data = filter_dates(standardize_english_ohlcv(raw), start_text, end_text)
+            if not data.empty:
+                candidates.append(data)
+        except Exception as exc:
+            errors.append(f"AKShare／新浪恒生指数：{exc}")
+    if not candidates:
+        raise RuntimeError("恒生指数基准获取失败。" + "；".join(errors))
+    return max(candidates, key=lambda data: _candidate_quality((data, "", "")))
 
 
 def _bao_first_row(result: Any) -> dict[str, Any]:
@@ -1018,6 +1205,38 @@ def fetch_us_fundamentals(symbol: str, last_price: float | None = None) -> Evide
     return EvidenceSnapshot(score is not None, "Yahoo Finance公开公司资料", fields, score, positives, risks, sec_notes + notes)
 
 
+def fetch_hk_fundamentals(code: str, last_price: float | None = None) -> EvidenceSnapshot:
+    normalized = normalize_hk_code(code)
+    symbol = hk_yahoo_ticker(normalized)
+    if yf is None:
+        return EvidenceSnapshot(False, "yfinance未安装", notes=["未取得港股公司资料，不参与基本面评分。"])
+    fields: dict[str, Any] = {}
+    notes: list[str] = []
+    try:
+        info = yf.Ticker(symbol).get_info()
+        fields = {
+            "公司名称": info.get("longName") or info.get("shortName") or normalized,
+            "行业": info.get("industry") or info.get("sector") or "未取得",
+            "报告期": "Yahoo Finance最近可得口径",
+            "净资产收益率": safe_float(info.get("returnOnEquity")),
+            "净利率": safe_float(info.get("profitMargins")),
+            "净利润同比": safe_float(info.get("earningsGrowth")),
+            "营收同比": safe_float(info.get("revenueGrowth")),
+            "资产负债率": None,
+            "经营现金流／净利润": None,
+            "市盈率TTM": safe_float(info.get("trailingPE")),
+            "市净率": safe_float(info.get("priceToBook")),
+            "总市值": safe_float(info.get("marketCap")),
+        }
+        debt_to_equity = safe_float(info.get("debtToEquity"))
+        if debt_to_equity is not None:
+            fields["债务／权益"] = debt_to_equity / 100 if abs(debt_to_equity) > 5 else debt_to_equity
+    except Exception as exc:
+        notes.append(f"Yahoo港股公司资料暂不可用：{exc}")
+    score, positives, risks = _score_fundamentals(fields)
+    return EvidenceSnapshot(score is not None, "Yahoo Finance港股公开公司资料", fields, score, positives, risks, notes)
+
+
 def derive_market_regime(benchmark: pd.DataFrame) -> dict[str, Any]:
     if benchmark is None or benchmark.empty:
         return {
@@ -1107,6 +1326,8 @@ def fetch_macro_snapshot(market: str, benchmark: pd.DataFrame) -> EvidenceSnapsh
                     score += 3 if direction == "下降" else -3 if direction == "上升" else 0
         except Exception as exc:
             notes.append(f"美国利率数据暂不可用：{exc}")
+    elif market == "港股":
+        notes.append("港股宏观环境以恒生指数的趋势、收益与波动状态为主要修正依据。")
     score = float(np.clip(score, 0, 100))
     return EvidenceSnapshot(True, "市场基准与公开宏观数据", fields, score, notes=notes)
 
@@ -1125,7 +1346,7 @@ def fetch_price_bundle(market: str, raw_code: str) -> PriceBundle:
             warnings.append(f"沪深300基准暂不可用：{exc}")
         asset_type = "场内基金" if is_exchange_traded_fund_code(code) else "A股个股"
         bundle = PriceBundle(stock, benchmark, code, name, provider, "沪深300", asset_type, "人民币元", warnings)
-    else:
+    elif market == "美股":
         code = normalize_us_code(raw_code)
         stock, name, provider = fetch_us_security(code, start_text, end_text)
         try:
@@ -1134,6 +1355,17 @@ def fetch_price_bundle(market: str, raw_code: str) -> PriceBundle:
             benchmark = pd.DataFrame(columns=["日期", "开盘", "最高", "最低", "收盘", "成交量"])
             warnings.append(f"标普500代理基准SPY暂不可用：{exc}")
         bundle = PriceBundle(stock, benchmark, code, name, provider, "标普500代理ETF（SPY）", "美股个股", "美元", warnings)
+    elif market == "港股":
+        code = normalize_hk_code(raw_code)
+        stock, name, provider = fetch_hk_security(code, start_text, end_text)
+        try:
+            benchmark = fetch_hk_benchmark(start_text, end_text)
+        except Exception as exc:
+            benchmark = pd.DataFrame(columns=["日期", "开盘", "最高", "最低", "收盘", "成交量"])
+            warnings.append(f"恒生指数基准暂不可用：{exc}")
+        bundle = PriceBundle(stock, benchmark, code, name, provider, "恒生指数（HSI）", "港股个股", "港元", warnings)
+    else:
+        raise ValueError("市场仅支持A股、美股或港股。")
 
     first_date = pd.Timestamp(bundle.stock["日期"].min())
     requested_start = pd.Timestamp(start_text)

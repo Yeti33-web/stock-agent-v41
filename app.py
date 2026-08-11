@@ -12,11 +12,14 @@ from agent_core import (
     calculate_amount_holding_values,
     calculate_holding_values,
     fetch_a_fundamentals,
+    fetch_hk_fundamentals,
+    fetch_hkd_cny_rate,
     fetch_macro_snapshot,
     fetch_price_bundle,
     fetch_usd_cny_rate,
     fetch_us_fundamentals,
     normalize_a_code,
+    normalize_hk_code,
     normalize_us_code,
     score_investor,
 )
@@ -31,7 +34,7 @@ from questionnaire import (
 
 
 st.set_page_config(
-    page_title="个人投资者股票决策辅助 Agent V5.4",
+    page_title="个人投资者股票决策辅助 Agent V5.5",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -71,7 +74,13 @@ def ensure_confirmed_stock() -> tuple[str, str]:
 
 
 def validate_code(market: str, code: str) -> str:
-    return normalize_a_code(code) if market == "A股" else normalize_us_code(code)
+    if market == "A股":
+        return normalize_a_code(code)
+    if market == "美股":
+        return normalize_us_code(code)
+    if market == "港股":
+        return normalize_hk_code(code)
+    raise ValueError("市场仅支持A股、美股或港股。")
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -84,7 +93,9 @@ def cached_price_bundle(market: str, code: str, request_token: int):
 def cached_fundamentals(market: str, code: str, last_price: float, asset_type: str) -> EvidenceSnapshot:
     if market == "A股":
         return fetch_a_fundamentals(code, last_price, asset_type)
-    return fetch_us_fundamentals(code, last_price)
+    if market == "美股":
+        return fetch_us_fundamentals(code, last_price)
+    return fetch_hk_fundamentals(code, last_price)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -95,6 +106,11 @@ def cached_macro(market: str, benchmark: pd.DataFrame) -> EvidenceSnapshot:
 @st.cache_data(ttl=21600, show_spinner=False)
 def cached_usd_cny_rate() -> dict:
     return fetch_usd_cny_rate()
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def cached_hkd_cny_rate() -> dict:
+    return fetch_hkd_cny_rate()
 
 
 def initialize_v5_state() -> None:
@@ -194,7 +210,7 @@ def load_current_user_data() -> None:
 
 def render_brand(subtitle: str = "") -> None:
     st.markdown('<div class="app-brand">Five-year evidence · Personal suitability</div>', unsafe_allow_html=True)
-    st.title("个人投资者股票决策辅助 Agent｜三位精度版 V5.4")
+    st.title("个人投资者股票决策辅助 Agent｜港股支持版 V5.5")
     st.caption(subtitle or "近五年真实公开行情 · 历史相似状态检索 · 个人风险适配 · 教学研究原型")
 
 
@@ -293,8 +309,13 @@ def analysis_home() -> None:
 
     stock_left, stock_right = st.columns([1, 1])
     with stock_left:
-        st.radio("市场", ["A股", "美股"], horizontal=True, key="v5_market", on_change=v5_market_changed)
-        placeholder = "例如：600519、300750" if st.session_state.v5_market == "A股" else "例如：AAPL、MSFT、NVDA"
+        st.radio("市场", ["A股", "美股", "港股"], horizontal=True, key="v5_market", on_change=v5_market_changed)
+        placeholders = {
+            "A股": "例如：600519、300750",
+            "美股": "例如：AAPL、MSFT、NVDA",
+            "港股": "例如：00700、09988，也可输入700或0700.HK",
+        }
+        placeholder = placeholders[st.session_state.v5_market]
         st.text_input("股票代码", key="v5_stock_code", placeholder=placeholder)
     with stock_right:
         st.radio("目前是否已经持有？", ["尚未持有", "已经持有"], horizontal=True, key="v5_holding_state")
@@ -319,7 +340,7 @@ def analysis_home() -> None:
         )
         holding_left, holding_right = st.columns(2)
         if st.session_state.v5_holding_method == "按持股数量填写":
-            unit = "元/股" if st.session_state.v5_market == "A股" else "美元/股"
+            unit = {"A股": "元/股", "美股": "美元/股", "港股": "港元/股"}[st.session_state.v5_market]
             share_step = 100.0 if st.session_state.v5_market == "A股" else 1.0
             with holding_left:
                 st.number_input(
@@ -711,9 +732,9 @@ def render_summary(bundle, analysis, profile) -> None:
                     f"成本计算：{shares:,.0f} 股 × {float(holding['cost_price']):,.3f} {bundle.price_unit}"
                     f" = {float(holding['cost_total_native']):,.3f} {holding['native_currency']}。"
                 )
-            if holding.get("usd_cny_rate") is not None:
+            if holding.get("fx_rate") is not None:
                 st.caption(
-                    f"人民币市值按 1 美元 = {float(holding['usd_cny_rate']):.3f} 元换算；"
+                    f"人民币市值按 1 {holding.get('native_currency', '外币')} = {float(holding['fx_rate']):.3f} 元换算；"
                     f"汇率日期 {holding.get('fx_date', '—')}，来源：{holding.get('fx_provider', '公开汇率接口')}。"
                 )
         else:
@@ -1037,13 +1058,19 @@ def page_three() -> None:
             holding_snapshot = None
             if st.session_state.confirmed_holding_state == "已经持有":
                 if st.session_state.confirmed_holding_method == "按持股数量填写":
-                    fx_snapshot = cached_usd_cny_rate() if confirmed_market == "美股" else None
+                    if confirmed_market == "美股":
+                        fx_snapshot = cached_usd_cny_rate()
+                    elif confirmed_market == "港股":
+                        fx_snapshot = cached_hkd_cny_rate()
+                    else:
+                        fx_snapshot = None
                     holding_snapshot = calculate_holding_values(
                         confirmed_market,
                         st.session_state.confirmed_share_count,
                         last_price,
                         st.session_state.confirmed_cost_price,
-                        float(fx_snapshot["rate"]) if fx_snapshot else None,
+                        usd_cny_rate=float(fx_snapshot["rate"]) if fx_snapshot and confirmed_market == "美股" else None,
+                        hkd_cny_rate=float(fx_snapshot["rate"]) if fx_snapshot and confirmed_market == "港股" else None,
                     )
                     if fx_snapshot:
                         holding_snapshot["fx_provider"] = fx_snapshot["provider"]
