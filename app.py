@@ -9,9 +9,12 @@ import streamlit as st
 from agent_core import (
     EvidenceSnapshot,
     analyze_all,
+    calculate_amount_holding_values,
+    calculate_holding_values,
     fetch_a_fundamentals,
     fetch_macro_snapshot,
     fetch_price_bundle,
+    fetch_usd_cny_rate,
     fetch_us_fundamentals,
     normalize_a_code,
     normalize_us_code,
@@ -89,6 +92,11 @@ def cached_macro(market: str, benchmark: pd.DataFrame) -> EvidenceSnapshot:
     return fetch_macro_snapshot(market, benchmark)
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def cached_usd_cny_rate() -> dict:
+    return fetch_usd_cny_rate()
+
+
 def initialize_v5_state() -> None:
     defaults = {
         "view": "analysis",
@@ -103,8 +111,13 @@ def initialize_v5_state() -> None:
         "confirmed_market": None,
         "confirmed_stock_code": None,
         "confirmed_holding_state": "尚未持有",
+        "confirmed_holding_method": "按持股数量填写",
+        "confirmed_share_count": 0.0,
         "confirmed_cost_price": 0.0,
         "confirmed_current_market_value": 0.0,
+        "confirmed_total_cost": 0.0,
+        "confirmed_additional_amount": 0.0,
+        "holding_snapshot": None,
         "analysis_request_token": 0,
     }
     for key, value in defaults.items():
@@ -115,8 +128,13 @@ def initialize_v5_state() -> None:
             "v5_market": "A股",
             "v5_stock_code": "",
             "v5_holding_state": "尚未持有",
+            "v5_holding_method": "按持股数量填写",
+            "v5_share_count": 0.0,
             "v5_cost_price": 0.0,
             "v5_current_value": 0.0,
+            "v5_total_cost": 0.0,
+            "v5_planned_action": "仅分析现有持仓",
+            "v5_additional_amount": 0.0,
             "v5_planned_amount": 50_000.0,
             "v5_leverage": "否",
         }
@@ -176,7 +194,7 @@ def load_current_user_data() -> None:
 
 def render_brand(subtitle: str = "") -> None:
     st.markdown('<div class="app-brand">Five-year evidence · Personal suitability</div>', unsafe_allow_html=True)
-    st.title("个人投资者股票决策辅助 Agent｜简化部署版")
+    st.title("个人投资者股票决策辅助 Agent｜简化部署版 V5.2")
     st.caption(subtitle or "近五年真实公开行情 · 当前会话风险测评 · 多周期风险判断 · 教学研究原型")
 
 
@@ -255,6 +273,11 @@ def questionnaire_page() -> None:
 
 def v5_market_changed() -> None:
     st.session_state.v5_stock_code = ""
+    st.session_state.v5_share_count = 0.0
+    st.session_state.v5_cost_price = 0.0
+    st.session_state.v5_current_value = 0.0
+    st.session_state.v5_total_cost = 0.0
+    st.session_state.v5_additional_amount = 0.0
 
 
 def analysis_home() -> None:
@@ -268,32 +291,122 @@ def analysis_home() -> None:
     st.markdown('<div class="hero-card"><b>选择本次要分析的股票</b><br><span class="muted">Agent统一使用最近五年行情；上市不足五年时使用全部可得数据并降低结论置信度。</span></div>', unsafe_allow_html=True)
     st.caption("提示：本版不注册账号。关闭网页、清除浏览器数据或更换设备后，需要重新完成风险测评。")
 
-    left, right = st.columns([1, 1])
-    with left:
+    stock_left, stock_right = st.columns([1, 1])
+    with stock_left:
         st.radio("市场", ["A股", "美股"], horizontal=True, key="v5_market", on_change=v5_market_changed)
         placeholder = "例如：600519、300750" if st.session_state.v5_market == "A股" else "例如：AAPL、MSFT、NVDA"
         st.text_input("股票代码", key="v5_stock_code", placeholder=placeholder)
-        st.number_input("本次计划总投资／持仓金额（折合人民币元）", min_value=1000.0, step=1000.0, key="v5_planned_amount")
-    with right:
+    with stock_right:
         st.radio("目前是否已经持有？", ["尚未持有", "已经持有"], horizontal=True, key="v5_holding_state")
-        if st.session_state.v5_holding_state == "已经持有":
-            unit = "元/股" if st.session_state.v5_market == "A股" else "美元/股"
-            st.number_input(f"持仓成本价（{unit}，可填0表示未知）", min_value=0.0, step=0.01, key="v5_cost_price")
-            st.number_input("当前持仓市值（折合人民币元）", min_value=0.0, step=1000.0, key="v5_current_value")
         st.radio("本次是否计划使用融资或其他杠杆？", ["否", "是"], horizontal=True, key="v5_leverage")
+
+    st.markdown("#### 本次持仓／投资信息")
+    if st.session_state.v5_holding_state == "尚未持有":
+        st.number_input(
+            "本次计划买入金额（人民币元）",
+            min_value=1000.0,
+            step=1000.0,
+            key="v5_planned_amount",
+            help="尚未持有时，只需填写本次拟投入金额。",
+        )
+    else:
+        st.radio(
+            "持仓信息填写方式",
+            ["按持股数量填写", "按持仓金额填写"],
+            horizontal=True,
+            key="v5_holding_method",
+        )
+        holding_left, holding_right = st.columns(2)
+        if st.session_state.v5_holding_method == "按持股数量填写":
+            unit = "元/股" if st.session_state.v5_market == "A股" else "美元/股"
+            share_step = 100.0 if st.session_state.v5_market == "A股" else 1.0
+            with holding_left:
+                st.number_input(
+                    "持股数量（股）",
+                    min_value=0.0,
+                    step=share_step,
+                    format="%.0f",
+                    key="v5_share_count",
+                )
+            with holding_right:
+                st.number_input(
+                    f"平均持仓成本价（{unit}，可填0表示未知）",
+                    min_value=0.0,
+                    step=0.01,
+                    key="v5_cost_price",
+                )
+            st.info("Agent会自动获取最新公开价格，并计算当前持仓市值；填写成本价后还会计算总成本和浮动盈亏。")
+        else:
+            with holding_left:
+                st.number_input(
+                    "当前持仓市值（折合人民币元）",
+                    min_value=0.0,
+                    step=1000.0,
+                    key="v5_current_value",
+                )
+            with holding_right:
+                st.number_input(
+                    "累计投入成本（人民币元，可填0表示未知）",
+                    min_value=0.0,
+                    step=1000.0,
+                    key="v5_total_cost",
+                )
+        st.radio(
+            "本次计划",
+            ["仅分析现有持仓", "还计划加仓"],
+            horizontal=True,
+            key="v5_planned_action",
+        )
+        if st.session_state.v5_planned_action == "还计划加仓":
+            st.number_input(
+                "计划新增金额（人民币元）",
+                min_value=0.0,
+                step=1000.0,
+                key="v5_additional_amount",
+            )
 
     if st.button("获取近五年真实数据并分析", type="primary", width="stretch"):
         try:
-            code = validate_code(st.session_state.v5_market, st.session_state.v5_stock_code)
-            planned = float(st.session_state.v5_planned_amount)
+            market = st.session_state.v5_market
+            holding_state = st.session_state.v5_holding_state
+            holding_method = st.session_state.v5_holding_method
+            code = validate_code(market, st.session_state.v5_stock_code)
+            share_count = float(st.session_state.get("v5_share_count", 0.0))
+            cost_price = float(st.session_state.get("v5_cost_price", 0.0))
+            current_value = float(st.session_state.get("v5_current_value", 0.0))
+            total_cost = float(st.session_state.get("v5_total_cost", 0.0))
+            additional = (
+                float(st.session_state.get("v5_additional_amount", 0.0))
+                if holding_state == "已经持有" and st.session_state.get("v5_planned_action") == "还计划加仓"
+                else 0.0
+            )
+            if holding_state == "尚未持有":
+                planned = float(st.session_state.v5_planned_amount)
+                if planned <= 0:
+                    raise ValueError("本次计划买入金额必须大于0。")
+            elif holding_method == "按持股数量填写":
+                if share_count <= 0:
+                    raise ValueError("你选择了已经持有，请填写大于0的持股数量。")
+                planned = max(additional, 1.0)
+            else:
+                if current_value <= 0:
+                    raise ValueError("你选择了已经持有，请填写大于0的当前持仓市值。")
+                planned = current_value + additional
+            if holding_state == "已经持有" and st.session_state.get("v5_planned_action") == "还计划加仓" and additional <= 0:
+                raise ValueError("你选择了还计划加仓，请填写大于0的计划新增金额。")
             asset_upper = profile.get("asset_upper")
-            if asset_upper is not None and planned > float(asset_upper):
+            if holding_state == "尚未持有" and asset_upper is not None and planned > float(asset_upper):
                 raise ValueError("本次计划金额高于风险问卷所选资产范围上限，请先到个人中心更新资料。")
-            st.session_state.confirmed_market = st.session_state.v5_market
+            st.session_state.confirmed_market = market
             st.session_state.confirmed_stock_code = code
-            st.session_state.confirmed_holding_state = st.session_state.v5_holding_state
-            st.session_state.confirmed_cost_price = float(st.session_state.get("v5_cost_price", 0.0))
-            st.session_state.confirmed_current_market_value = float(st.session_state.get("v5_current_value", 0.0))
+            st.session_state.confirmed_holding_state = holding_state
+            st.session_state.confirmed_holding_method = holding_method
+            st.session_state.confirmed_share_count = share_count
+            st.session_state.confirmed_cost_price = cost_price
+            st.session_state.confirmed_current_market_value = current_value
+            st.session_state.confirmed_total_cost = total_cost
+            st.session_state.confirmed_additional_amount = additional
+            st.session_state.holding_snapshot = None
             st.session_state.profile = compose_analysis_profile(profile, planned, st.session_state.v5_leverage)
             st.session_state.analysis_request_token += 1
             st.session_state.view = "result"
@@ -349,7 +462,20 @@ def personal_center() -> None:
 
 
 def clear_stock_widgets() -> None:
-    for key in ["v5_market", "v5_stock_code", "v5_holding_state", "v5_cost_price", "v5_current_value", "v5_planned_amount", "v5_leverage"]:
+    for key in [
+        "v5_market",
+        "v5_stock_code",
+        "v5_holding_state",
+        "v5_holding_method",
+        "v5_share_count",
+        "v5_cost_price",
+        "v5_current_value",
+        "v5_total_cost",
+        "v5_planned_action",
+        "v5_additional_amount",
+        "v5_planned_amount",
+        "v5_leverage",
+    ]:
         st.session_state.pop(key, None)
     st.session_state.view = "analysis"
 
@@ -450,15 +576,24 @@ def render_summary(bundle, analysis, profile) -> None:
             st.write("历史数据不足，无法选择周期。")
     with right:
         position = analysis["position"]
-        st.markdown("#### 风险预算参考上限")
-        if position["upper_pct"] > 0:
-            st.markdown(f"**可投资金融资产的 {position['lower_pct']:.1%}—{position['upper_pct']:.1%}**")
-            st.write(f"按你填写的资产口径，对应约 **{position['lower_amount']:,.0f}—{position['upper_amount']:,.0f} 元**。")
-            if profile["planned_amount"] > position["upper_amount"]:
-                st.warning(f"你计划的 {profile['planned_amount']:,.0f} 元高于模型风险预算上限，主要问题是集中度，而不是股票一定不会上涨。")
+        if st.session_state.confirmed_holding_state == "已经持有":
+            st.markdown("#### 现有仓位与新增风险预算")
+            st.write(f"模型建议的该股票**总仓位上限**约为 **{position['upper_amount']:,.0f} 元**。")
+            if position["remaining_upper_amount"] > 0:
+                st.markdown(f"扣除现有持仓后，**新增风险预算参考上限约 {position['remaining_upper_amount']:,.0f} 元**。")
+            else:
+                st.markdown("**当前新增风险预算：0 元**")
+                st.write("这不表示你的实际仓位是0，而是模型当前不建议继续增加该股票的风险敞口。")
         else:
-            st.markdown("**当前新增风险预算：0%**")
-            st.write("原因来自个人适配、安全限制、数据不足或当前时点偏弱；详情见下方。")
+            st.markdown("#### 风险预算参考上限")
+            if position["upper_pct"] > 0:
+                st.markdown(f"**可投资金融资产的 {position['lower_pct']:.1%}—{position['upper_pct']:.1%}**")
+                st.write(f"按你填写的资产口径，对应约 **{position['lower_amount']:,.0f}—{position['upper_amount']:,.0f} 元**。")
+                if profile["planned_amount"] > position["upper_amount"]:
+                    st.warning(f"你计划的 {profile['planned_amount']:,.0f} 元高于模型风险预算上限，主要问题是集中度，而不是股票一定不会上涨。")
+            else:
+                st.markdown("**当前新增风险预算：0%**")
+                st.write("原因来自个人适配、安全限制、数据不足或当前时点偏弱；详情见下方。")
 
     positives = []
     risks = list(analysis["risk_reasons"])
@@ -482,16 +617,46 @@ def render_summary(bundle, analysis, profile) -> None:
 
     if st.session_state.confirmed_holding_state == "已经持有":
         st.markdown("#### 已有持仓检查")
-        current_value = float(st.session_state.confirmed_current_market_value)
+        holding = analysis.get("holding_snapshot") or {}
+        current_value = float(holding.get("current_rmb") or 0.0)
         current_ratio = current_value / profile["investable_assets"] if profile["investable_assets"] else 0
-        cost = float(st.session_state.confirmed_cost_price)
-        current_return = analysis["metrics"]["latest_price"] / cost - 1 if cost > 0 else None
-        held_cols = st.columns(3)
+        current_return = holding.get("return_rate")
+        total_cost_rmb = holding.get("cost_total_rmb")
+        profit_rmb = holding.get("profit_rmb")
+        held_cols = st.columns(4)
         held_cols[0].metric("当前仓位占比", f"{current_ratio:.1%}")
-        held_cols[1].metric("最新公开价格", f"{analysis['metrics']['latest_price']:.2f} {bundle.price_unit}")
-        held_cols[2].metric("相对成本变化", pct(current_return) if current_return is not None else "成本未知")
+        held_cols[1].metric("当前持仓市值", f"{current_value:,.0f} 元")
+        held_cols[2].metric("累计投入成本", f"{total_cost_rmb:,.0f} 元" if total_cost_rmb is not None else "成本未知")
+        held_cols[3].metric("持仓收益率", pct(current_return) if current_return is not None else "成本未知")
+
+        if holding.get("method") == "按持股数量填写":
+            shares = float(holding["shares"])
+            native_value = float(holding["current_native"])
+            st.write(
+                f"市值计算：**{shares:,.0f} 股 × {float(holding['latest_price']):,.2f} {bundle.price_unit}"
+                f" = {native_value:,.2f} {holding['native_currency']}**。"
+            )
+            if holding.get("cost_price") is not None:
+                st.caption(
+                    f"成本计算：{shares:,.0f} 股 × {float(holding['cost_price']):,.2f} {bundle.price_unit}"
+                    f" = {float(holding['cost_total_native']):,.2f} {holding['native_currency']}。"
+                )
+            if holding.get("usd_cny_rate") is not None:
+                st.caption(
+                    f"人民币市值按 1 美元 = {float(holding['usd_cny_rate']):.4f} 元换算；"
+                    f"汇率日期 {holding.get('fx_date', '—')}，来源：{holding.get('fx_provider', '公开汇率接口')}。"
+                )
+        else:
+            st.caption("当前持仓市值由用户按人民币金额填写；股票最新公开价格仍用于行情与风险分析。")
+        if profit_rmb is not None:
+            st.write(f"按所填成本估算的浮动盈亏：**{profit_rmb:+,.0f} 元**。")
+        else:
+            st.info("你没有填写成本信息，因此Agent不会编造收益率或盈亏数值。")
+        st.caption("当前仓位是根据你提供的持仓计算出的事实数据；模型新增风险预算是风险控制参考，两者不是同一个数值。")
         if current_ratio > analysis["position"]["upper_pct"] and analysis["position"]["upper_pct"] > 0:
             st.warning("当前仓位已经高于模型风险预算上限。这里提示的是集中度风险，不等同于要求立即卖出。")
+        elif analysis["position"]["upper_pct"] == 0 and current_value > 0:
+            st.warning("模型当前给出的新增风险预算为0；你的实际持仓仍按上方市值和仓位显示，并没有被当成0。")
 
 
 def render_risk_budget(analysis, profile) -> None:
@@ -500,11 +665,19 @@ def render_risk_budget(analysis, profile) -> None:
     if analysis["suitability"]["hard_reasons"]:
         for reason in analysis["suitability"]["hard_reasons"]:
             st.error(reason)
+    if st.session_state.confirmed_holding_state == "已经持有":
+        amount_rows = [
+            ["当前持仓市值", f"{profile.get('current_holding_value', 0):,.0f} 元"],
+            ["本次计划新增", f"{profile.get('additional_amount', 0):,.0f} 元"],
+            ["分析后的总风险敞口", f"{profile['planned_amount']:,.0f} 元"],
+        ]
+    else:
+        amount_rows = [["本次计划买入金额", f"{profile['planned_amount']:,.0f} 元"]]
     table = pd.DataFrame(
-        [
-            ["计划投资金额", f"{profile['planned_amount']:,.0f} 元"],
+        amount_rows
+        + [
             ["可投资金融资产", profile.get("asset_band", f"约 {profile['investable_assets']:,.0f} 元")],
-            ["计划集中度（按区间代表值估算）", f"{profile['planned_amount'] / profile['investable_assets']:.1%}"],
+            ["总风险敞口占比（按资产区间代表值估算）", f"{profile['planned_amount'] / profile['investable_assets']:.1%}"],
             ["资金来源", profile["fund_source"]],
             ["最早用款时间", profile["earliest_need"]],
             ["用户风险等级", analysis["investor_level"]],
@@ -613,7 +786,7 @@ def render_professional(bundle, analysis) -> None:
 
 def page_three() -> None:
     confirmed_market, confirmed_code = ensure_confirmed_stock()
-    profile = st.session_state.profile
+    profile = dict(st.session_state.profile)
     render_brand(f"正在分析 {confirmed_market}｜{confirmed_code}")
     st.subheader(f"Agent自动获取 {confirmed_code} 近五年数据并分析")
     with st.status("正在完成自动分析……", expanded=True) as status:
@@ -624,6 +797,36 @@ def page_three() -> None:
                 raise RuntimeError(f"股票代码校验失败：请求 {confirmed_code}，数据源返回 {bundle.code}。已停止分析，避免使用错误股票数据。")
             status.write("2/4 获取基准、公司财务和估值信息")
             last_price = float(bundle.stock["收盘"].iloc[-1])
+            holding_snapshot = None
+            if st.session_state.confirmed_holding_state == "已经持有":
+                if st.session_state.confirmed_holding_method == "按持股数量填写":
+                    fx_snapshot = cached_usd_cny_rate() if confirmed_market == "美股" else None
+                    holding_snapshot = calculate_holding_values(
+                        confirmed_market,
+                        st.session_state.confirmed_share_count,
+                        last_price,
+                        st.session_state.confirmed_cost_price,
+                        float(fx_snapshot["rate"]) if fx_snapshot else None,
+                    )
+                    if fx_snapshot:
+                        holding_snapshot["fx_provider"] = fx_snapshot["provider"]
+                        holding_snapshot["fx_date"] = pd.Timestamp(fx_snapshot["date"]).date().isoformat()
+                else:
+                    holding_snapshot = calculate_amount_holding_values(
+                        st.session_state.confirmed_current_market_value,
+                        st.session_state.confirmed_total_cost,
+                    )
+                current_value = float(holding_snapshot["current_rmb"])
+                total_exposure = current_value + float(st.session_state.confirmed_additional_amount)
+                profile["planned_amount"] = total_exposure
+                profile["current_holding_value"] = current_value
+                profile["additional_amount"] = float(st.session_state.confirmed_additional_amount)
+                profile["holding_state"] = "已经持有"
+                st.session_state.confirmed_current_market_value = current_value
+            else:
+                profile["current_holding_value"] = 0.0
+                profile["additional_amount"] = float(profile["planned_amount"])
+                profile["holding_state"] = "尚未持有"
             fundamental = cached_fundamentals(confirmed_market, bundle.code, round(last_price, 6), bundle.asset_type)
             company_name = fundamental.fields.get("公司名称") if fundamental.fields else None
             if company_name:
@@ -632,6 +835,20 @@ def page_three() -> None:
             macro = cached_macro(confirmed_market, bundle.benchmark)
             status.write("4/4 计算多周期信号、适配程度和风险预算")
             analysis = analyze_all(bundle, profile, fundamental, macro)
+            current_holding = float(profile.get("current_holding_value") or 0.0)
+            assets = float(profile.get("investable_assets") or 0.0)
+            analysis["position"]["current_amount"] = current_holding
+            analysis["position"]["current_pct"] = current_holding / assets if assets > 0 else 0.0
+            analysis["position"]["remaining_upper_amount"] = max(
+                float(analysis["position"]["upper_amount"]) - current_holding,
+                0.0,
+            )
+            analysis["position"]["remaining_upper_pct"] = (
+                analysis["position"]["remaining_upper_amount"] / assets if assets > 0 else 0.0
+            )
+            analysis["holding_snapshot"] = holding_snapshot
+            st.session_state.holding_snapshot = holding_snapshot
+            st.session_state.profile = profile
             status.update(label="分析完成", state="complete", expanded=False)
         except Exception as exc:
             status.update(label="真实数据获取或分析失败", state="error", expanded=True)

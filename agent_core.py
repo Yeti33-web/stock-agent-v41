@@ -146,6 +146,79 @@ def ratio_fraction(value: Any) -> float | None:
     return number
 
 
+def calculate_holding_values(
+    market: str,
+    shares: float,
+    latest_price: float,
+    cost_price: float | None = None,
+    usd_cny_rate: float | None = None,
+) -> dict[str, Any]:
+    share_count = float(shares)
+    price = float(latest_price)
+    if share_count <= 0:
+        raise ValueError("持股数量必须大于0。")
+    if price <= 0:
+        raise ValueError("最新公开价格无效，暂时无法计算持仓市值。")
+    if market not in {"A股", "美股"}:
+        raise ValueError("暂不支持该市场的持仓换算。")
+
+    current_native = share_count * price
+    rate = 1.0
+    if market == "美股":
+        rate = float(usd_cny_rate or 0.0)
+        if rate <= 0:
+            raise ValueError("美元兑人民币汇率暂不可用，请改用“按持仓金额填写”。")
+    current_rmb = current_native * rate
+
+    parsed_cost = float(cost_price or 0.0)
+    cost_total_native = share_count * parsed_cost if parsed_cost > 0 else None
+    profit_native = current_native - cost_total_native if cost_total_native is not None else None
+    return_rate = price / parsed_cost - 1 if parsed_cost > 0 else None
+    return {
+        "method": "按持股数量填写",
+        "shares": share_count,
+        "latest_price": price,
+        "native_currency": "人民币元" if market == "A股" else "美元",
+        "current_native": current_native,
+        "current_rmb": current_rmb,
+        "cost_price": parsed_cost if parsed_cost > 0 else None,
+        "cost_total_native": cost_total_native,
+        "cost_total_rmb": cost_total_native * rate if cost_total_native is not None else None,
+        "profit_native": profit_native,
+        "profit_rmb": profit_native * rate if profit_native is not None else None,
+        "return_rate": return_rate,
+        "usd_cny_rate": rate if market == "美股" else None,
+    }
+
+
+def calculate_amount_holding_values(
+    current_rmb: float,
+    total_cost_rmb: float | None = None,
+) -> dict[str, Any]:
+    current_value = float(current_rmb)
+    if current_value <= 0:
+        raise ValueError("当前持仓市值必须大于0。")
+
+    parsed_cost = float(total_cost_rmb or 0.0)
+    profit_rmb = current_value - parsed_cost if parsed_cost > 0 else None
+    return_rate = current_value / parsed_cost - 1 if parsed_cost > 0 else None
+    return {
+        "method": "按持仓金额填写",
+        "shares": None,
+        "latest_price": None,
+        "native_currency": "人民币元",
+        "current_native": current_value,
+        "current_rmb": current_value,
+        "cost_price": None,
+        "cost_total_native": parsed_cost if parsed_cost > 0 else None,
+        "cost_total_rmb": parsed_cost if parsed_cost > 0 else None,
+        "profit_native": profit_rmb,
+        "profit_rmb": profit_rmb,
+        "return_rate": return_rate,
+        "usd_cny_rate": None,
+    }
+
+
 def normalize_a_code(raw_code: str) -> str:
     code = raw_code.strip().upper()
     for suffix in (".SZ", ".SH", ".SS", ".BJ"):
@@ -363,6 +436,73 @@ def fetch_stooq_history(symbol: str, start_text: str, end_text: str) -> pd.DataF
         return pd.DataFrame()
     raw = pd.read_csv(StringIO(response.text))
     return standardize_english_ohlcv(raw)
+
+
+def fetch_usd_cny_rate() -> dict[str, Any]:
+    end_text = date.today().strftime("%Y-%m-%d")
+    start_text = (pd.Timestamp(end_text) - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
+    errors: list[str] = []
+    candidates: list[dict[str, Any]] = []
+
+    try:
+        data, _ = fetch_yahoo_chart_history("CNY=X", start_text, end_text)
+        if not data.empty:
+            latest = data.iloc[-1]
+            candidates.append(
+                {
+                    "rate": float(latest["收盘"]),
+                    "date": pd.Timestamp(latest["日期"]),
+                    "provider": "Yahoo Finance美元兑人民币公开日线（CNY=X）",
+                }
+            )
+    except Exception as exc:
+        errors.append(f"Yahoo图表接口：{exc}")
+
+    try:
+        data = fetch_yfinance_history("CNY=X", start_text, end_text)
+        if not data.empty:
+            latest = data.iloc[-1]
+            candidates.append(
+                {
+                    "rate": float(latest["收盘"]),
+                    "date": pd.Timestamp(latest["日期"]),
+                    "provider": "yfinance美元兑人民币备用日线（CNY=X）",
+                }
+            )
+    except Exception as exc:
+        errors.append(f"yfinance：{exc}")
+
+    try:
+        response = _get_with_retry(
+            "https://fred.stlouisfed.org/graph/fredgraph.csv",
+            params={"id": "DEXCHUS"},
+            timeout=20,
+        )
+        raw = pd.read_csv(StringIO(response.text))
+        date_column = next((column for column in raw.columns if "date" in str(column).lower()), None)
+        value_column = next((column for column in raw.columns if str(column).upper() == "DEXCHUS"), None)
+        if date_column and value_column:
+            values = raw[[date_column, value_column]].copy()
+            values[value_column] = pd.to_numeric(values[value_column], errors="coerce")
+            values[date_column] = pd.to_datetime(values[date_column], errors="coerce")
+            values = values.dropna()
+            if not values.empty:
+                latest = values.iloc[-1]
+                candidates.append(
+                    {
+                        "rate": float(latest[value_column]),
+                        "date": pd.Timestamp(latest[date_column]),
+                        "provider": "美国FRED美元兑人民币参考汇率（DEXCHUS）",
+                    }
+                )
+    except Exception as exc:
+        errors.append(f"FRED：{exc}")
+
+    valid = [item for item in candidates if 4.0 <= float(item["rate"]) <= 12.0]
+    if not valid:
+        detail = "；".join(errors) if errors else "公开接口没有返回有效汇率"
+        raise RuntimeError(f"美元兑人民币汇率获取失败。{detail}")
+    return max(valid, key=lambda item: pd.Timestamp(item["date"]))
 
 
 def fetch_akshare_us_history(symbol: str, start_text: str, end_text: str) -> tuple[pd.DataFrame, str]:
