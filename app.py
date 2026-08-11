@@ -9,6 +9,7 @@ import streamlit as st
 from agent_core import (
     EvidenceSnapshot,
     analyze_all,
+    analyze_sell_signals,
     calculate_amount_holding_values,
     calculate_holding_values,
     fetch_a_fundamentals,
@@ -34,7 +35,7 @@ from questionnaire import (
 
 
 st.set_page_config(
-    page_title="个人投资者股票决策辅助 Agent V5.5",
+    page_title="个人投资者股票决策辅助 Agent V5.6",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -210,7 +211,7 @@ def load_current_user_data() -> None:
 
 def render_brand(subtitle: str = "") -> None:
     st.markdown('<div class="app-brand">Five-year evidence · Personal suitability</div>', unsafe_allow_html=True)
-    st.title("个人投资者股票决策辅助 Agent｜港股支持版 V5.5")
+    st.title("个人投资者股票决策辅助 Agent｜持仓卖出信号版 V5.6")
     st.caption(subtitle or "近五年真实公开行情 · 历史相似状态检索 · 个人风险适配 · 教学研究原型")
 
 
@@ -750,6 +751,151 @@ def render_summary(bundle, analysis, profile) -> None:
             st.warning("模型当前给出的新增风险预算为0；你的实际持仓仍按上方市值和仓位显示，并没有被当成0。")
 
 
+def render_sell_signals(bundle, analysis, profile) -> None:
+    sell = analysis.get("sell_signals") or {}
+    st.subheader("已有持仓的卖出信号")
+    st.caption("该模块只管理已经持有的股票，不改变原有买入分析、风险等级、持有周期或仓位预算。")
+    if not sell.get("available"):
+        st.warning(sell.get("summary", "当前数据不足，无法形成卖出信号。"))
+        return
+
+    status = str(sell.get("status") or "证据不足")
+    message = f"### 当前状态：{status}\n{sell.get('summary', '')}"
+    if status == "退出复核":
+        st.error(message)
+    elif status == "考虑分批减仓":
+        st.warning(message)
+    elif status == "警戒观察":
+        st.info(message)
+    else:
+        st.success(message)
+
+    metrics = st.columns(5)
+    metrics[0].metric("最新公开收盘价", f"{float(sell['latest_price']):,.3f} {bundle.price_unit}")
+    metrics[1].metric(
+        "持仓收益率",
+        pct(sell.get("current_return")) if sell.get("current_return") is not None else "成本未知",
+    )
+    metrics[2].metric(
+        f"近{int(sell['peak_window'])}日高点回撤",
+        pct(sell.get("peak_drawdown")),
+    )
+    metrics[3].metric("核心信号", f"{int(sell.get('hard_count', 0))}/2")
+    metrics[4].metric("辅助信号", f"{int(sell.get('auxiliary_count', 0))}/4")
+    st.caption(
+        f"数据日期：{pd.Timestamp(sell['latest_date']).date().isoformat()}；"
+        f"Agent所选周期：{sell.get('selected_horizon', '—')}；{sell.get('next_review', '按期复核')}。"
+    )
+
+    rows = []
+    for signal in sell.get("signals", []):
+        rows.append(
+            {
+                "信号": signal["name"],
+                "级别": signal["level"],
+                "当前状态": signal["state"],
+                "当前证据": signal["current_text"],
+                "触发规则": signal["threshold_text"],
+                "解释": signal["detail"],
+            }
+        )
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    st.markdown("#### 动态价格参考")
+    price_cols = st.columns(3)
+    price_cols[0].metric(
+        "成本风险参考价",
+        (
+            f"{float(sell['cost_protection_price']):,.3f} {bundle.price_unit}"
+            if sell.get("cost_protection_price") is not None
+            else "成本价未知"
+        ),
+    )
+    price_cols[1].metric(
+        f"MA{int(sell['fast_window'])}趋势参考",
+        f"{float(sell['fast_ma']):,.3f} {bundle.price_unit}",
+    )
+    price_cols[2].metric(
+        "盈利回撤保护价",
+        (
+            f"{float(sell['trailing_protection_price']):,.3f} {bundle.price_unit}"
+            if sell.get("trailing_protection_price") is not None
+            else "尚未启用"
+        ),
+    )
+    st.caption(
+        "这些价格会随最新行情、股票波动率和Agent选择的持有周期变化；它们是收盘后复核参考，不是保证成交的自动订单。"
+    )
+
+    close = analysis["metrics"]["close"]
+    display_close = close.tail(min(252, len(close)))
+    fast_series = close.rolling(int(sell["fast_window"])).mean().reindex(display_close.index)
+    slow_series = close.rolling(int(sell["slow_window"])).mean().reindex(display_close.index)
+    chart = go.Figure()
+    chart.add_trace(
+        go.Scatter(
+            x=display_close.index,
+            y=display_close,
+            name="收盘价",
+            line=dict(color="#2563eb", width=2),
+            hovertemplate="%{x|%Y-%m-%d}<br>收盘价 %{y:,.3f}<extra></extra>",
+        )
+    )
+    chart.add_trace(
+        go.Scatter(
+            x=fast_series.index,
+            y=fast_series,
+            name=f"MA{int(sell['fast_window'])}",
+            line=dict(color="#f59e0b", width=1.4),
+            hovertemplate="%{x|%Y-%m-%d}<br>快线 %{y:,.3f}<extra></extra>",
+        )
+    )
+    chart.add_trace(
+        go.Scatter(
+            x=slow_series.index,
+            y=slow_series,
+            name=f"MA{int(sell['slow_window'])}",
+            line=dict(color="#7c3aed", width=1.4),
+            hovertemplate="%{x|%Y-%m-%d}<br>慢线 %{y:,.3f}<extra></extra>",
+        )
+    )
+    if sell.get("cost_protection_price") is not None:
+        chart.add_hline(
+            y=float(sell["cost_protection_price"]),
+            line_dash="dot",
+            line_color="#dc2626",
+            annotation_text="成本风险参考",
+        )
+    if sell.get("trailing_protection_price") is not None:
+        chart.add_hline(
+            y=float(sell["trailing_protection_price"]),
+            line_dash="dot",
+            line_color="#16a34a",
+            annotation_text="盈利回撤保护",
+        )
+    chart.update_layout(
+        title="最近一年价格与动态复核线",
+        height=410,
+        margin=dict(l=20, r=20, t=55, b=20),
+        yaxis_title=bundle.price_unit,
+        yaxis_tickformat=",.3f",
+        legend_orientation="h",
+    )
+    st.plotly_chart(chart, width="stretch")
+
+    st.markdown("#### 下一步观察条件")
+    for condition in sell.get("reference_conditions", []):
+        st.write(f"- {condition}")
+    st.info(
+        "分级规则：没有触发信号为“继续持有”；出现核心或辅助信号为“警戒观察”；"
+        "一个核心信号与至少一个辅助信号同时出现为“考虑分批减仓”；两个核心信号同时出现为“退出复核”。"
+    )
+    with st.expander("使用限制与执行风险"):
+        for limitation in sell.get("limitations", []):
+            st.write(f"- {limitation}")
+        st.write("- 实际操作仍需结合公告、停牌、流动性、税费以及个人交易纪律人工确认。")
+
+
 def render_risk_budget(analysis, profile) -> None:
     st.subheader("个人适配与风险预算")
     st.write(f"**适配结论：{analysis['suitability']['fit']}。** {analysis['suitability']['fit_reason']}。")
@@ -1111,6 +1257,11 @@ def page_three() -> None:
                 analysis["position"]["remaining_upper_amount"] / assets if assets > 0 else 0.0
             )
             analysis["holding_snapshot"] = holding_snapshot
+            analysis["sell_signals"] = (
+                analyze_sell_signals(bundle, analysis, profile, holding_snapshot)
+                if st.session_state.confirmed_holding_state == "已经持有"
+                else None
+            )
             st.session_state.holding_snapshot = holding_snapshot
             st.session_state.profile = profile
             status.update(label="分析完成", state="complete", expanded=False)
@@ -1143,26 +1294,33 @@ def page_three() -> None:
             st.info(warning)
 
     view_mode = st.radio("结果显示", ["简明模式", "专业模式"], horizontal=True, help="两种模式使用同一套计算结果，只改变解释深度。")
-    tab_names = ["结论", "相似周期预测", "风险与仓位", "持有周期", "数据证据"]
+    tab_names = ["结论"]
+    if st.session_state.confirmed_holding_state == "已经持有":
+        tab_names.append("卖出信号")
+    tab_names.extend(["相似周期预测", "风险与仓位", "持有周期", "数据证据"])
     if view_mode == "专业模式":
         tab_names.append("专业指标")
     tabs = st.tabs(tab_names)
-    with tabs[0]:
+    tab_map = dict(zip(tab_names, tabs))
+    with tab_map["结论"]:
         render_summary(bundle, analysis, profile)
-    with tabs[1]:
+    if "卖出信号" in tab_map:
+        with tab_map["卖出信号"]:
+            render_sell_signals(bundle, analysis, profile)
+    with tab_map["相似周期预测"]:
         render_analog_forecast(analysis)
-    with tabs[2]:
+    with tab_map["风险与仓位"]:
         render_risk_budget(analysis, profile)
-    with tabs[3]:
+    with tab_map["持有周期"]:
         render_horizons(analysis)
-    with tabs[4]:
+    with tab_map["数据证据"]:
         render_evidence(bundle, analysis)
     if view_mode == "专业模式":
-        with tabs[5]:
+        with tab_map["专业指标"]:
             render_professional(bundle, analysis)
 
     st.divider()
-    st.warning("本程序是学习和内部研究原型，不是中国建设银行正式产品，不构成投资建议，不预测确定收益，也不会代替持牌机构的适当性管理和人工审核。")
+    st.warning("该分析结果仅供参考，本模型仅用于学习与研究。")
     left, middle, right = st.columns(3)
     if left.button("换一只股票", width="stretch"):
         clear_stock_widgets()

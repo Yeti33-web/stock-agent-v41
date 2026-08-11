@@ -28,8 +28,8 @@ except ImportError:
 
 
 HISTORY_YEARS = 5
-HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 StockResearchAgent/5.5"}
-SEC_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "IndividualInvestorResearchAgent/5.5 educational-use")}
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 StockResearchAgent/5.6"}
+SEC_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "IndividualInvestorResearchAgent/5.6 educational-use")}
 
 
 HORIZONS: list[dict[str, Any]] = [
@@ -2177,6 +2177,329 @@ def build_final_conclusion(
     if fit == "有限适配":
         return "条件适配，可进一步研究", "风险等级略高于用户等级，需要严格限制仓位并按期复核。"
     return "在风险预算内相对适配", "个人条件与股票风险基本匹配，但仍需满足仓位和复核条件。"
+
+
+def _personal_loss_cap(max_loss: str | None) -> float:
+    """Translate the questionnaire band into a conservative position-level ceiling."""
+    return {
+        "不超过5%": 0.05,
+        "5%—10%": 0.10,
+        "10%—20%": 0.20,
+        "20%—30%": 0.30,
+        "超过30%": 0.30,
+    }.get(str(max_loss or ""), 0.15)
+
+
+def analyze_sell_signals(
+    bundle: PriceBundle,
+    analysis: dict[str, Any],
+    profile: dict[str, Any],
+    holding_snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Evaluate transparent end-of-day exit signals for an existing position.
+
+    This is deliberately separate from ``analyze_all`` so adding position
+    management cannot change the existing buy-side score, suitability,
+    horizon or position-budget calculations.
+    """
+    if not holding_snapshot:
+        return {
+            "available": False,
+            "status": "未持有",
+            "summary": "只有选择“已经持有”并填写持仓后，才会计算卖出信号。",
+            "signals": [],
+            "limitations": [],
+        }
+
+    prices = bundle.stock.copy()
+    prices["日期"] = pd.to_datetime(prices["日期"], errors="coerce")
+    prices["收盘"] = pd.to_numeric(prices["收盘"], errors="coerce")
+    prices["成交量"] = pd.to_numeric(prices.get("成交量"), errors="coerce")
+    prices = prices.dropna(subset=["日期", "收盘"]).drop_duplicates("日期").sort_values("日期")
+    close = prices.set_index("日期")["收盘"]
+    volume = prices.set_index("日期")["成交量"]
+    if len(close) < 20:
+        return {
+            "available": False,
+            "status": "证据不足",
+            "summary": "可得日线不足20个交易日，无法形成可复核的卖出信号。",
+            "signals": [],
+            "limitations": ["股票历史数据过短。"],
+        }
+
+    selected = analysis.get("selected_horizon") or {}
+    selected_days = int(selected.get("days") or 20)
+    fast_window = int(selected.get("fast") or 20)
+    slow_window = int(selected.get("slow") or 60)
+    fast_window = max(5, min(fast_window, len(close)))
+    slow_window = max(fast_window, min(slow_window, len(close)))
+    latest_price = float(close.iloc[-1])
+    latest_date = pd.Timestamp(close.index[-1])
+
+    fast_series = close.rolling(fast_window, min_periods=fast_window).mean()
+    slow_series = close.rolling(slow_window, min_periods=slow_window).mean()
+    fast_ma = float(fast_series.iloc[-1])
+    slow_ma = float(slow_series.iloc[-1])
+    comparable = pd.concat(
+        [close.rename("close"), fast_series.rename("fast")], axis=1
+    ).dropna()
+    consecutive_below_fast = bool(
+        len(comparable) >= 2
+        and (comparable["close"].tail(2) < comparable["fast"].tail(2)).all()
+    )
+    fast_below_slow = bool(np.isfinite(slow_ma) and fast_ma < slow_ma)
+    trend_triggered = consecutive_below_fast and fast_below_slow
+    trend_warning = bool(latest_price < fast_ma or fast_below_slow)
+
+    annual_volatility = safe_float(analysis.get("metrics", {}).get("annual_volatility"))
+    if annual_volatility is None or annual_volatility <= 0:
+        annual_volatility = 0.25
+    risk_span_days = max(5, min(selected_days, 120))
+    normal_horizon_move = annual_volatility * float(np.sqrt(risk_span_days / 252))
+    personal_cap = _personal_loss_cap(profile.get("max_loss"))
+    dynamic_loss_limit = float(
+        min(personal_cap, np.clip(normal_horizon_move * 0.85, 0.04, 0.20))
+    )
+
+    current_return = safe_float(holding_snapshot.get("return_rate"))
+    cost_price = safe_float(holding_snapshot.get("cost_price"))
+    loss_triggered = bool(
+        current_return is not None and current_return <= -dynamic_loss_limit
+    )
+    cost_protection_price = (
+        float(cost_price * (1 - dynamic_loss_limit)) if cost_price is not None and cost_price > 0 else None
+    )
+
+    peak_window = min(max(slow_window, 60), 252, len(close))
+    recent_peak = float(close.tail(peak_window).max())
+    peak_drawdown = float(latest_price / recent_peak - 1) if recent_peak > 0 else None
+    trailing_limit = float(
+        np.clip(annual_volatility * np.sqrt(20 / 252) * 1.25, 0.06, 0.18)
+    )
+    trailing_protection_price = float(recent_peak * (1 - trailing_limit))
+    trailing_activated = bool(
+        current_return is not None and current_return >= max(0.08, trailing_limit)
+    )
+    trailing_triggered = bool(
+        trailing_activated
+        and peak_drawdown is not None
+        and peak_drawdown <= -trailing_limit
+    )
+
+    relative_window = 20 if selected_days <= 20 else 60
+    benchmark_close = analysis.get("metrics", {}).get("benchmark_close")
+    relative_excess = None
+    relative_threshold = -float(
+        np.clip(annual_volatility * np.sqrt(relative_window / 252) * 0.50, 0.03, 0.10)
+    )
+    if isinstance(benchmark_close, pd.Series) and not benchmark_close.empty:
+        aligned = pd.concat(
+            [close.rename("stock"), benchmark_close.rename("benchmark")], axis=1
+        ).dropna()
+        if len(aligned) > relative_window:
+            stock_return = float(aligned["stock"].iloc[-1] / aligned["stock"].iloc[-1 - relative_window] - 1)
+            benchmark_return = float(
+                aligned["benchmark"].iloc[-1] / aligned["benchmark"].iloc[-1 - relative_window] - 1
+            )
+            relative_excess = stock_return - benchmark_return
+    relative_triggered = bool(
+        relative_excess is not None and relative_excess <= relative_threshold
+    )
+
+    fundamental: EvidenceSnapshot = analysis.get("fundamental") or EvidenceSnapshot(False, "未取得")
+    fundamental_score = safe_float(fundamental.score)
+    deterioration_terms = (
+        "净资产收益率为负",
+        "净利率为负",
+        "净利润同比下降",
+        "营业收入同比下降",
+        "经营现金流与净利润方向不一致",
+    )
+    deterioration_risks = [
+        item for item in fundamental.risks if any(term in item for term in deterioration_terms)
+    ]
+    fundamental_triggered = bool(
+        fundamental_score is not None
+        and ((fundamental_score <= 35 and len(fundamental.risks) >= 1) or len(deterioration_risks) >= 2)
+    )
+
+    analog_target_days = 5 if selected_days <= 5 else 20 if selected_days <= 20 else 60 if selected_days <= 60 else 120
+    analog_item = next(
+        (
+            item
+            for item in (analysis.get("analog_forecast") or {}).get("horizons", [])
+            if item.get("available") and int(item.get("days", -1)) == analog_target_days
+        ),
+        None,
+    )
+    analog_usable = bool(
+        analog_item and int(analog_item.get("confidence_score", 0)) >= ANALOG_SCORE_MIN_CONFIDENCE
+    )
+    analog_triggered = bool(
+        analog_usable
+        and float(analog_item.get("positive_ratio")) <= 0.35
+        and float(analog_item.get("median_return")) < 0
+    )
+
+    volume20 = float(volume.tail(20).mean()) if volume.tail(20).notna().any() else np.nan
+    latest_volume = safe_float(volume.iloc[-1])
+    down_day = bool(len(close) >= 2 and close.iloc[-1] < close.iloc[-2])
+    volume_confirmation = bool(
+        latest_volume is not None
+        and np.isfinite(volume20)
+        and volume20 > 0
+        and latest_volume >= volume20 * 1.20
+        and down_day
+    )
+
+    signals: list[dict[str, Any]] = [
+        {
+            "key": "personal_loss",
+            "name": "个人亏损边界",
+            "level": "核心",
+            "state": "触发" if loss_triggered else "数据不足" if current_return is None else "未触发",
+            "triggered": loss_triggered,
+            "current": current_return,
+            "threshold": -dynamic_loss_limit,
+            "current_text": "成本未知" if current_return is None else f"当前持仓收益率 {current_return:.3%}",
+            "threshold_text": f"亏损达到 {-dynamic_loss_limit:.3%}",
+            "detail": "结合问卷最大可承受损失、所选周期和股票正常波动计算，不对所有股票使用同一个固定比例。",
+        },
+        {
+            "key": "trend_break",
+            "name": "趋势破位",
+            "level": "核心",
+            "state": "触发" if trend_triggered else "警戒" if trend_warning else "未触发",
+            "triggered": trend_triggered,
+            "current": latest_price,
+            "threshold": fast_ma,
+            "current_text": f"现价 {latest_price:.3f}；MA{fast_window} {fast_ma:.3f}；MA{slow_window} {slow_ma:.3f}",
+            "threshold_text": f"连续2个交易日低于MA{fast_window}，且MA{fast_window}低于MA{slow_window}",
+            "detail": "只有价格和均线结构同时确认才算核心触发，降低单日假跌破影响。"
+            + (" 最新下跌日同时放量。" if volume_confirmation else ""),
+        },
+        {
+            "key": "profit_trailing",
+            "name": "盈利回撤保护",
+            "level": "辅助",
+            "state": "触发" if trailing_triggered else "尚未启用" if current_return is None or not trailing_activated else "未触发",
+            "triggered": trailing_triggered,
+            "current": peak_drawdown,
+            "threshold": -trailing_limit,
+            "current_text": f"近{peak_window}日高点回撤 {peak_drawdown:.3%}" if peak_drawdown is not None else "数据不足",
+            "threshold_text": f"盈利达到启用条件后，高点回撤达到 {-trailing_limit:.3%}",
+            "detail": "未填写首次买入日期，因此使用与所选周期匹配的近期高点，不冒充实际持有期最高点。",
+        },
+        {
+            "key": "relative_weakness",
+            "name": "相对市场弱势",
+            "level": "辅助",
+            "state": "触发" if relative_triggered else "数据不足" if relative_excess is None else "未触发",
+            "triggered": relative_triggered,
+            "current": relative_excess,
+            "threshold": relative_threshold,
+            "current_text": f"近{relative_window}日相对基准 {relative_excess:.3%}" if relative_excess is not None else "基准数据不足",
+            "threshold_text": f"相对基准弱于 {relative_threshold:.3%}",
+            "detail": f"市场基准为{bundle.benchmark_name}；阈值随股票波动率调整。",
+        },
+        {
+            "key": "fundamental_risk",
+            "name": "基本面恶化信号",
+            "level": "辅助",
+            "state": "触发" if fundamental_triggered else "数据不足" if fundamental_score is None else "未触发",
+            "triggered": fundamental_triggered,
+            "current": fundamental_score,
+            "threshold": 35.0,
+            "current_text": f"基本面评分 {fundamental_score:.3f}/100" if fundamental_score is not None else "财务数据不足",
+            "threshold_text": "评分≤35且存在风险，或至少2项经营指标恶化",
+            "detail": "；".join(deterioration_risks[:3]) if deterioration_risks else "未发现足够的经营恶化证据。",
+        },
+        {
+            "key": "analog_negative",
+            "name": "相似周期转弱",
+            "level": "辅助",
+            "state": "触发" if analog_triggered else "可信度不足" if not analog_usable else "未触发",
+            "triggered": analog_triggered,
+            "current": float(analog_item.get("median_return")) if analog_usable else None,
+            "threshold": 0.0,
+            "current_text": (
+                f"上涨样本占比 {float(analog_item['positive_ratio']):.3%}；中位收益 {float(analog_item['median_return']):.3%}"
+                if analog_usable
+                else "没有达到最低可信度的相似样本"
+            ),
+            "threshold_text": "可信度达标、上涨样本占比≤35%，且收益中位数为负",
+            "detail": "只作为辅助信号，绝不单独决定卖出。",
+        },
+    ]
+
+    hard_count = sum(1 for item in signals if item["level"] == "核心" and item["triggered"])
+    auxiliary_count = sum(1 for item in signals if item["level"] == "辅助" and item["triggered"])
+    if hard_count >= 2:
+        status = "退出复核"
+        summary = "个人亏损边界与趋势破位同时触发，应优先复核退出或明显降低风险敞口。"
+    elif hard_count >= 1 and auxiliary_count >= 1:
+        status = "考虑分批减仓"
+        summary = "核心风险与辅助风险同时出现，可结合流动性和交易成本制定分批降低仓位方案。"
+    elif hard_count >= 1 or auxiliary_count >= 1:
+        status = "警戒观察"
+        summary = "已经出现风险信号，暂不宜仅因短期反弹而忽略原定退出纪律。"
+    else:
+        status = "继续持有"
+        summary = "当前未触发设定的核心或辅助卖出条件，继续按所选周期复核。"
+
+    reference_conditions: list[str] = []
+    if cost_protection_price is not None:
+        reference_conditions.append(
+            f"成本风险参考：收盘价降至或低于 {cost_protection_price:.3f} {bundle.price_unit}。"
+        )
+    else:
+        reference_conditions.append("未取得每股成本价，因此不显示可能误导的成本保护价格。")
+    reference_conditions.append(
+        f"趋势确认参考：连续2个交易日收盘低于MA{fast_window}（当前 {fast_ma:.3f}），"
+        f"同时MA{fast_window}低于MA{slow_window}。"
+    )
+    if trailing_activated:
+        reference_conditions.append(
+            f"盈利回撤参考：近期高点保护价约 {trailing_protection_price:.3f} {bundle.price_unit}。"
+        )
+    else:
+        reference_conditions.append("盈利回撤保护尚未启用；需要先达到与股票波动相匹配的浮盈。")
+
+    limitations = [
+        "本模块使用最近公开日线，只适合收盘后复核，不提供盘中实时卖出提醒。",
+        "网页关闭后不会在后台自动监控，重新打开或刷新后才会获取最新公开数据。",
+        "基本面数据采用最近公开口径；未取得数据的项目不会被当成利空。",
+        "参考触发价不是自动止损订单，也不保证实际成交价格。",
+    ]
+    if not bundle.history_complete:
+        limitations.append("该股票可得历史不足五年，卖出信号的统计背景置信度已降低。")
+
+    return {
+        "available": True,
+        "status": status,
+        "summary": summary,
+        "hard_count": hard_count,
+        "auxiliary_count": auxiliary_count,
+        "signals": signals,
+        "latest_price": latest_price,
+        "latest_date": latest_date,
+        "selected_horizon": selected.get("name") or "数据不足",
+        "next_review": selected.get("review") or "下一交易日收盘后复核",
+        "fast_window": fast_window,
+        "slow_window": slow_window,
+        "fast_ma": fast_ma,
+        "slow_ma": slow_ma,
+        "current_return": current_return,
+        "recent_peak": recent_peak,
+        "peak_window": peak_window,
+        "peak_drawdown": peak_drawdown,
+        "personal_loss_limit": dynamic_loss_limit,
+        "cost_protection_price": cost_protection_price,
+        "trailing_limit": trailing_limit,
+        "trailing_protection_price": trailing_protection_price if trailing_activated else None,
+        "reference_conditions": reference_conditions,
+        "limitations": limitations,
+    }
 
 
 def analyze_all(
