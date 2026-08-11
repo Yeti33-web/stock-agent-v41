@@ -1623,7 +1623,7 @@ def score_stock_risk(metrics: dict[str, Any]) -> tuple[int, int, str, list[str]]
         level, level_number = "R4（中高风险）", 4
     else:
         level, level_number = "R5（高风险）", 5
-    reasons = [f"近一年年化波动率约{volatility:.1%}" if np.isfinite(volatility) else "波动率数据不足", f"近五年或上市以来最大回撤约{metrics['max_drawdown']:.1%}"]
+    reasons = [f"近一年年化波动率约{volatility:.3%}" if np.isfinite(volatility) else "波动率数据不足", f"近五年或上市以来最大回撤约{metrics['max_drawdown']:.3%}"]
     if beta > 1.2:
         reasons.append("相对市场的Beta较高")
     if metrics["abnormal_days"]:
@@ -1758,8 +1758,8 @@ def score_horizons(
             score += analog_adjustment
             analog_used = True
             reasons.append(
-                f"{analog_evidence['sample_count']}个相似周期后历史上涨占比{positive_ratio:.0%}，"
-                f"中位收益{median_return:.1%}"
+                f"{analog_evidence['sample_count']}个相似周期后历史上涨占比{positive_ratio:.3%}，"
+                f"中位收益{median_return:.3%}"
             )
         elif analog_evidence:
             reasons.append("相似周期历史回测可信度不足，已展示但未参与评分")
@@ -2007,7 +2007,7 @@ def analyze_all(
     if selected_analog:
         conclusion_reason += (
             f" 相似历史状态后{selected_analog['days']}个交易日上涨样本占比"
-            f"{selected_analog['positive_ratio']:.0%}，中位收益{selected_analog['median_return']:.1%}；"
+            f"{selected_analog['positive_ratio']:.3%}，中位收益{selected_analog['median_return']:.3%}；"
             "该频率不等于确定概率。"
         )
     return {

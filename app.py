@@ -31,7 +31,7 @@ from questionnaire import (
 
 
 st.set_page_config(
-    page_title="个人投资者股票决策辅助 Agent V5.3",
+    page_title="个人投资者股票决策辅助 Agent V5.4",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -194,7 +194,7 @@ def load_current_user_data() -> None:
 
 def render_brand(subtitle: str = "") -> None:
     st.markdown('<div class="app-brand">Five-year evidence · Personal suitability</div>', unsafe_allow_html=True)
-    st.title("个人投资者股票决策辅助 Agent｜相似周期预测版 V5.3")
+    st.title("个人投资者股票决策辅助 Agent｜三位精度版 V5.4")
     st.caption(subtitle or "近五年真实公开行情 · 历史相似状态检索 · 个人风险适配 · 教学研究原型")
 
 
@@ -306,6 +306,7 @@ def analysis_home() -> None:
             "本次计划买入金额（人民币元）",
             min_value=1000.0,
             step=1000.0,
+            format="%.3f",
             key="v5_planned_amount",
             help="尚未持有时，只需填写本次拟投入金额。",
         )
@@ -332,7 +333,8 @@ def analysis_home() -> None:
                 st.number_input(
                     f"平均持仓成本价（{unit}，可填0表示未知）",
                     min_value=0.0,
-                    step=0.01,
+                    step=0.001,
+                    format="%.3f",
                     key="v5_cost_price",
                 )
             st.info("Agent会自动获取最新公开价格，并计算当前持仓市值；填写成本价后还会计算总成本和浮动盈亏。")
@@ -342,6 +344,7 @@ def analysis_home() -> None:
                     "当前持仓市值（折合人民币元）",
                     min_value=0.0,
                     step=1000.0,
+                    format="%.3f",
                     key="v5_current_value",
                 )
             with holding_right:
@@ -349,6 +352,7 @@ def analysis_home() -> None:
                     "累计投入成本（人民币元，可填0表示未知）",
                     min_value=0.0,
                     step=1000.0,
+                    format="%.3f",
                     key="v5_total_cost",
                 )
         st.radio(
@@ -362,6 +366,7 @@ def analysis_home() -> None:
                 "计划新增金额（人民币元）",
                 min_value=0.0,
                 step=1000.0,
+                format="%.3f",
                 key="v5_additional_amount",
             )
 
@@ -495,16 +500,25 @@ def app_sidebar() -> None:
         st.caption("行情统一使用最近五年；相似样本不足时拒绝预测；新股标注低置信度。")
 
 
-def pct(value: float | None, digits: int = 1) -> str:
+DISPLAY_DECIMALS = 3
+
+
+def pct(value: float | None, digits: int = DISPLAY_DECIMALS) -> str:
     if value is None or pd.isna(value):
         return "数据不足"
     return f"{value:.{digits}%}"
 
 
-def number(value: float | None, digits: int = 2) -> str:
+def number(value: float | None, digits: int = DISPLAY_DECIMALS) -> str:
     if value is None or pd.isna(value):
         return "数据不足"
     return f"{value:.{digits}f}"
+
+
+def money(value: float, unit: str = "元", signed: bool = False) -> str:
+    parsed = float(value)
+    formatted = f"{parsed:+,.3f}" if signed else f"{parsed:,.3f}"
+    return f"{formatted} {unit}"
 
 
 def format_field(name: str, value) -> str:
@@ -513,11 +527,11 @@ def format_field(name: str, value) -> str:
     if name in {"净资产收益率", "净利率", "净利润同比", "营收同比", "资产负债率", "经营现金流／净利润", "债务／权益"}:
         parsed = float(value)
         parsed = parsed / 100 if abs(parsed) > 5 else parsed
-        return f"{parsed:.1%}"
+        return f"{parsed:.3%}"
     if name in {"市盈率TTM", "市净率"}:
-        return f"{float(value):.2f}"
+        return f"{float(value):.3f}"
     if name == "总市值":
-        return f"{float(value):,.0f}"
+        return f"{float(value):,.3f}"
     return str(value)
 
 
@@ -539,18 +553,42 @@ def render_price_charts(bundle, analysis) -> None:
     chart_start = close.index.max() - pd.DateOffset(years=5)
     display_close = close[close.index >= chart_start]
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=display_close.index, y=display_close, name="收盘价", line=dict(width=2)))
+    fig.add_trace(
+        go.Scatter(
+            x=display_close.index,
+            y=display_close,
+            name="收盘价",
+            line=dict(width=2),
+            hovertemplate="%{x|%Y-%m-%d}<br>收盘价 %{y:,.3f}<extra></extra>",
+        )
+    )
     for window, color in [(20, "#f59e0b"), (60, "#16a34a"), (250, "#7c3aed")]:
         if len(close) >= window:
             moving = close.rolling(window).mean()
             moving = moving[moving.index >= chart_start]
-            fig.add_trace(go.Scatter(x=moving.index, y=moving, name=f"MA{window}", line=dict(width=1.2, color=color)))
-    fig.update_layout(title="最近五年或全部可得价格", height=390, margin=dict(l=20, r=20, t=55, b=20), yaxis_title=bundle.price_unit, legend_orientation="h")
+            fig.add_trace(
+                go.Scatter(
+                    x=moving.index,
+                    y=moving,
+                    name=f"MA{window}",
+                    line=dict(width=1.2, color=color),
+                    hovertemplate=f"%{{x|%Y-%m-%d}}<br>MA{window} %{{y:,.3f}}<extra></extra>",
+                )
+            )
+    fig.update_layout(
+        title="最近五年或全部可得价格",
+        height=390,
+        margin=dict(l=20, r=20, t=55, b=20),
+        yaxis_title=bundle.price_unit,
+        yaxis_tickformat=",.3f",
+        legend_orientation="h",
+    )
     st.plotly_chart(fig, width="stretch")
 
     drawdown = metrics["drawdown"]
     drawdown_fig = go.Figure(go.Scatter(x=drawdown.index, y=drawdown, fill="tozeroy", line=dict(color="#dc2626"), name="回撤"))
-    drawdown_fig.update_layout(title="近五年或上市以来回撤", height=340, margin=dict(l=20, r=20, t=55, b=20), yaxis_tickformat=".0%")
+    drawdown_fig.update_traces(hovertemplate="%{x|%Y-%m-%d}<br>回撤 %{y:.3%}<extra></extra>")
+    drawdown_fig.update_layout(title="近五年或上市以来回撤", height=340, margin=dict(l=20, r=20, t=55, b=20), yaxis_tickformat=".3%")
     st.plotly_chart(drawdown_fig, width="stretch")
 
 
@@ -562,7 +600,7 @@ def render_summary(bundle, analysis, profile) -> None:
     columns[1].metric("用户类型", analysis["style"])
     columns[2].metric("股票风险等级", analysis["stock_risk_level"], f"{analysis['stock_risk_score']}/100")
     columns[3].metric("个人适配", analysis["suitability"]["fit"])
-    columns[4].metric("数据完整度", f"{analysis['data_confidence']}%")
+    columns[4].metric("数据完整度", f"{float(analysis['data_confidence']):.3f}%")
 
     analog = analysis.get("analog_forecast") or {}
     st.markdown("#### 历史相似状态情景")
@@ -574,7 +612,7 @@ def render_summary(bundle, analysis, profile) -> None:
         f"{analog.get('confidence_score', 0)}/100",
     )
     best_similarity = analog.get("best_similarity")
-    analog_cols[2].metric("最高相似度", f"{best_similarity:.0f}/100" if best_similarity is not None else "无有效样本")
+    analog_cols[2].metric("最高相似度", f"{best_similarity:.3f}/100" if best_similarity is not None else "无有效样本")
     selected_analog = None
     if selected:
         selected_analog = next(
@@ -588,9 +626,9 @@ def render_summary(bundle, analysis, profile) -> None:
     if selected_analog:
         st.info(
             f"与当前状态相似的{selected_analog['sample_count']}个历史样本中，随后"
-            f"{selected_analog['days']}个交易日上涨样本占比为{selected_analog['positive_ratio']:.0%}，"
-            f"收益中位数{selected_analog['median_return']:.1%}，"
-            f"中间50%区间{selected_analog['q25_return']:.1%}至{selected_analog['q75_return']:.1%}。"
+            f"{selected_analog['days']}个交易日上涨样本占比为{selected_analog['positive_ratio']:.3%}，"
+            f"收益中位数{selected_analog['median_return']:.3%}，"
+            f"中间50%区间{selected_analog['q25_return']:.3%}至{selected_analog['q75_return']:.3%}。"
         )
     elif not analog.get("available"):
         st.warning("有效相似样本不足，Agent没有生成方向预测；其他风险分析仍可继续查看。")
@@ -610,21 +648,21 @@ def render_summary(bundle, analysis, profile) -> None:
         position = analysis["position"]
         if st.session_state.confirmed_holding_state == "已经持有":
             st.markdown("#### 现有仓位与新增风险预算")
-            st.write(f"模型建议的该股票**总仓位上限**约为 **{position['upper_amount']:,.0f} 元**。")
+            st.write(f"模型建议的该股票**总仓位上限**约为 **{money(position['upper_amount'])}**。")
             if position["remaining_upper_amount"] > 0:
-                st.markdown(f"扣除现有持仓后，**新增风险预算参考上限约 {position['remaining_upper_amount']:,.0f} 元**。")
+                st.markdown(f"扣除现有持仓后，**新增风险预算参考上限约 {money(position['remaining_upper_amount'])}**。")
             else:
-                st.markdown("**当前新增风险预算：0 元**")
+                st.markdown("**当前新增风险预算：0.000 元**")
                 st.write("这不表示你的实际仓位是0，而是模型当前不建议继续增加该股票的风险敞口。")
         else:
             st.markdown("#### 风险预算参考上限")
             if position["upper_pct"] > 0:
-                st.markdown(f"**可投资金融资产的 {position['lower_pct']:.1%}—{position['upper_pct']:.1%}**")
-                st.write(f"按你填写的资产口径，对应约 **{position['lower_amount']:,.0f}—{position['upper_amount']:,.0f} 元**。")
+                st.markdown(f"**可投资金融资产的 {position['lower_pct']:.3%}—{position['upper_pct']:.3%}**")
+                st.write(f"按你填写的资产口径，对应约 **{position['lower_amount']:,.3f}—{position['upper_amount']:,.3f} 元**。")
                 if profile["planned_amount"] > position["upper_amount"]:
-                    st.warning(f"你计划的 {profile['planned_amount']:,.0f} 元高于模型风险预算上限，主要问题是集中度，而不是股票一定不会上涨。")
+                    st.warning(f"你计划的 {money(profile['planned_amount'])}高于模型风险预算上限，主要问题是集中度，而不是股票一定不会上涨。")
             else:
-                st.markdown("**当前新增风险预算：0%**")
+                st.markdown("**当前新增风险预算：0.000%**")
                 st.write("原因来自个人适配、安全限制、数据不足或当前时点偏弱；详情见下方。")
 
     positives = []
@@ -656,32 +694,32 @@ def render_summary(bundle, analysis, profile) -> None:
         total_cost_rmb = holding.get("cost_total_rmb")
         profit_rmb = holding.get("profit_rmb")
         held_cols = st.columns(4)
-        held_cols[0].metric("当前仓位占比", f"{current_ratio:.1%}")
-        held_cols[1].metric("当前持仓市值", f"{current_value:,.0f} 元")
-        held_cols[2].metric("累计投入成本", f"{total_cost_rmb:,.0f} 元" if total_cost_rmb is not None else "成本未知")
+        held_cols[0].metric("当前仓位占比", f"{current_ratio:.3%}")
+        held_cols[1].metric("当前持仓市值", money(current_value))
+        held_cols[2].metric("累计投入成本", money(total_cost_rmb) if total_cost_rmb is not None else "成本未知")
         held_cols[3].metric("持仓收益率", pct(current_return) if current_return is not None else "成本未知")
 
         if holding.get("method") == "按持股数量填写":
             shares = float(holding["shares"])
             native_value = float(holding["current_native"])
             st.write(
-                f"市值计算：**{shares:,.0f} 股 × {float(holding['latest_price']):,.2f} {bundle.price_unit}"
-                f" = {native_value:,.2f} {holding['native_currency']}**。"
+                f"市值计算：**{shares:,.0f} 股 × {float(holding['latest_price']):,.3f} {bundle.price_unit}"
+                f" = {native_value:,.3f} {holding['native_currency']}**。"
             )
             if holding.get("cost_price") is not None:
                 st.caption(
-                    f"成本计算：{shares:,.0f} 股 × {float(holding['cost_price']):,.2f} {bundle.price_unit}"
-                    f" = {float(holding['cost_total_native']):,.2f} {holding['native_currency']}。"
+                    f"成本计算：{shares:,.0f} 股 × {float(holding['cost_price']):,.3f} {bundle.price_unit}"
+                    f" = {float(holding['cost_total_native']):,.3f} {holding['native_currency']}。"
                 )
             if holding.get("usd_cny_rate") is not None:
                 st.caption(
-                    f"人民币市值按 1 美元 = {float(holding['usd_cny_rate']):.4f} 元换算；"
+                    f"人民币市值按 1 美元 = {float(holding['usd_cny_rate']):.3f} 元换算；"
                     f"汇率日期 {holding.get('fx_date', '—')}，来源：{holding.get('fx_provider', '公开汇率接口')}。"
                 )
         else:
             st.caption("当前持仓市值由用户按人民币金额填写；股票最新公开价格仍用于行情与风险分析。")
         if profit_rmb is not None:
-            st.write(f"按所填成本估算的浮动盈亏：**{profit_rmb:+,.0f} 元**。")
+            st.write(f"按所填成本估算的浮动盈亏：**{money(profit_rmb, signed=True)}**。")
         else:
             st.info("你没有填写成本信息，因此Agent不会编造收益率或盈亏数值。")
         st.caption("当前仓位是根据你提供的持仓计算出的事实数据；模型新增风险预算是风险控制参考，两者不是同一个数值。")
@@ -699,17 +737,17 @@ def render_risk_budget(analysis, profile) -> None:
             st.error(reason)
     if st.session_state.confirmed_holding_state == "已经持有":
         amount_rows = [
-            ["当前持仓市值", f"{profile.get('current_holding_value', 0):,.0f} 元"],
-            ["本次计划新增", f"{profile.get('additional_amount', 0):,.0f} 元"],
-            ["分析后的总风险敞口", f"{profile['planned_amount']:,.0f} 元"],
+            ["当前持仓市值", money(profile.get("current_holding_value", 0))],
+            ["本次计划新增", money(profile.get("additional_amount", 0))],
+            ["分析后的总风险敞口", money(profile["planned_amount"])],
         ]
     else:
-        amount_rows = [["本次计划买入金额", f"{profile['planned_amount']:,.0f} 元"]]
+        amount_rows = [["本次计划买入金额", money(profile["planned_amount"])]]
     table = pd.DataFrame(
         amount_rows
         + [
-            ["可投资金融资产", profile.get("asset_band", f"约 {profile['investable_assets']:,.0f} 元")],
-            ["总风险敞口占比（按资产区间代表值估算）", f"{profile['planned_amount'] / profile['investable_assets']:.1%}"],
+            ["可投资金融资产", profile.get("asset_band", f"约 {money(profile['investable_assets'])}")],
+            ["总风险敞口占比（按资产区间代表值估算）", f"{profile['planned_amount'] / profile['investable_assets']:.3%}"],
             ["资金来源", profile["fund_source"]],
             ["最早用款时间", profile["earliest_need"]],
             ["用户风险等级", analysis["investor_level"]],
@@ -822,13 +860,14 @@ def render_analog_forecast(analysis) -> None:
                     name=f"{item['days']}日",
                     boxpoints="outliers",
                     marker_color="#2563eb",
+                    hovertemplate="收益 %{y:.3%}<extra>%{fullData.name}</extra>",
                 )
             )
         distribution.add_hline(y=0, line_dash="dot", line_color="#667085")
         distribution.update_layout(
             title="相似周期后续收益分布",
             height=390,
-            yaxis_tickformat=".0%",
+            yaxis_tickformat=".3%",
             yaxis_title="从相似时点开始计算的后续收益",
             margin=dict(l=20, r=20, t=55, b=20),
             showlegend=False,
@@ -847,7 +886,8 @@ def render_analog_forecast(analysis) -> None:
                     mode="lines",
                     line=dict(width=1.2),
                     opacity=0.42,
-                    name=f"{pd.Timestamp(path['anchor_date']).date()} · {path['similarity']:.0f}",
+                    name=f"{pd.Timestamp(path['anchor_date']).date()} · {path['similarity']:.3f}",
+                    hovertemplate="后续第%{x}日<br>收益 %{y:.3%}<extra>%{fullData.name}</extra>",
                 )
             )
         if sorted_paths:
@@ -867,7 +907,7 @@ def render_analog_forecast(analysis) -> None:
             height=410,
             xaxis_title="后续交易日",
             yaxis_title="相对相似时点的收益",
-            yaxis_tickformat=".0%",
+            yaxis_tickformat=".3%",
             margin=dict(l=20, r=20, t=55, b=20),
         )
         st.plotly_chart(path_figure, width="stretch")
@@ -881,7 +921,7 @@ def render_analog_forecast(analysis) -> None:
                 {
                     "状态观察起点": str(pd.Timestamp(item["start_date"]).date()),
                     "相似时点": str(pd.Timestamp(item["anchor_date"]).date()),
-                    "相似度": f"{item['similarity']:.0f}/100",
+                    "相似度": f"{item['similarity']:.3f}/100",
                     "随后5日": pct(item.get("return_5")),
                     "随后20日": pct(item.get("return_20")),
                     "随后60日": pct(item.get("return_60")),
@@ -954,7 +994,7 @@ def render_professional(bundle, analysis) -> None:
         ["行情首日", str(metrics["first_date"].date())],
         ["行情末日", str(metrics["last_date"].date())],
         ["交易日数量", f"{metrics['rows']}"],
-        ["最新价格", f"{metrics['latest_price']:.2f} {bundle.price_unit}"],
+        ["最新价格", f"{metrics['latest_price']:.3f} {bundle.price_unit}"],
         ["近一年年化波动率", pct(metrics["annual_volatility"])],
         ["下行波动率", pct(metrics["downside_volatility"])],
         ["近五年或上市以来最大回撤", pct(metrics["max_drawdown"])],
