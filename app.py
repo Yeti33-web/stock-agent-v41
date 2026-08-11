@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -13,99 +15,56 @@ from agent_core import (
     fetch_us_fundamentals,
     normalize_a_code,
     normalize_us_code,
+    score_investor,
+)
+from questionnaire import (
+    QUESTIONS,
+    answers_complete,
+    answers_to_profile,
+    compose_analysis_profile,
+    first_unanswered_index,
+    public_profile_rows,
 )
 
 
 st.set_page_config(
-    page_title="个人投资者股票决策辅助 Agent V4.1",
+    page_title="个人投资者股票决策辅助 Agent 简化版",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 st.markdown(
     """
     <style>
-    .block-container {padding-top: 2rem; padding-bottom: 3rem; max-width: 1280px;}
-    .hero-card {padding: 1.2rem 1.35rem; border: 1px solid #e4e7ec; border-radius: 16px; background: #f8fafc; margin-bottom: 1rem;}
-    .result-card {padding: 1rem 1.15rem; border-radius: 14px; background: #f7f9fc; border-left: 5px solid #2563eb;}
-    .muted {color: #667085; font-size: .92rem;}
-    div[data-testid="stMetric"] {border: 1px solid #e7eaf0; padding: .8rem; border-radius: 12px; background: white;}
+    :root {--brand:#1d4ed8; --ink:#172033; --muted:#667085; --line:#e4e7ec; --soft:#f6f8fb;}
+    .stApp {background:linear-gradient(180deg,#f8fbff 0,#ffffff 360px); color:var(--ink);}
+    .block-container {padding-top:1.35rem; padding-bottom:3rem; max-width:1220px;}
+    .app-brand {font-size:.82rem; font-weight:700; color:#1d4ed8; letter-spacing:.08em; text-transform:uppercase;}
+    .hero-card {padding:1.35rem 1.5rem; border:1px solid #dbe5f3; border-radius:20px; background:rgba(255,255,255,.92); margin:.7rem 0 1.2rem; box-shadow:0 12px 30px rgba(29,78,216,.06);}
+    .question-card {padding:1.8rem; border:1px solid #dbe5f3; border-radius:22px; background:white; box-shadow:0 18px 50px rgba(16,24,40,.07); margin:1rem 0;}
+    .result-card {padding:1.1rem 1.25rem; border-radius:16px; background:#f7f9fc; border-left:5px solid #2563eb;}
+    .muted {color:var(--muted); font-size:.92rem;}
+    div[data-testid="stMetric"] {border:1px solid #e4eaf2; padding:.9rem; border-radius:14px; background:white; box-shadow:0 5px 15px rgba(16,24,40,.035);}
+    div.stButton > button {border-radius:12px; min-height:2.8rem;}
+    div[data-testid="stForm"] {border:1px solid #e4eaf2; border-radius:18px; padding:1.25rem; background:white;}
+    [data-testid="stSidebar"] {background:#f7f9fc;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 
-def initialize_state() -> None:
-    persistent_defaults = {
-        "step": 1,
-        "confirmed_market": None,
-        "confirmed_stock_code": None,
-        "confirmed_holding_state": "尚未持有",
-        "confirmed_cost_price": 0.0,
-        "confirmed_current_market_value": 0.0,
-        "analysis_request_token": 0,
-    }
-    for key, value in persistent_defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-    # Streamlit会清理离开页面后不再显示的控件状态，因此输入值与确认值必须使用不同的key。
-    if st.session_state.step == 1:
-        input_defaults = {
-            "market_input": "A股",
-            "stock_code_input": "",
-            "holding_state_input": "尚未持有",
-            "cost_price_input": 0.0,
-            "current_market_value_input": 0.0,
-        }
-        for key, value in input_defaults.items():
-            if key not in st.session_state:
-                st.session_state[key] = value
-
-
-def market_changed() -> None:
-    st.session_state.stock_code_input = ""
-
-
-def restore_confirmed_inputs() -> None:
-    st.session_state.market_input = st.session_state.confirmed_market or "A股"
-    st.session_state.stock_code_input = st.session_state.confirmed_stock_code or ""
-    st.session_state.holding_state_input = st.session_state.confirmed_holding_state
-    st.session_state.cost_price_input = float(st.session_state.confirmed_cost_price)
-    st.session_state.current_market_value_input = float(st.session_state.confirmed_current_market_value)
-    st.session_state.step = 1
-
-
-def start_new_stock() -> None:
-    for key in ["market_input", "stock_code_input", "holding_state_input", "cost_price_input", "current_market_value_input"]:
-        st.session_state.pop(key, None)
-    st.session_state.step = 1
-
-
 def ensure_confirmed_stock() -> tuple[str, str]:
     market = st.session_state.confirmed_market
     code = st.session_state.confirmed_stock_code
     if not market or not code:
-        st.error("尚未确认本次要分析的股票，请返回第一步重新选择。")
+        st.error("尚未确认本次要分析的股票，请返回股票分析页重新选择。")
         if st.button("返回选择股票"):
-            start_new_stock()
+            st.session_state.view = "analysis"
             st.rerun()
         st.stop()
     return str(market), str(code)
-
-
-def render_header() -> None:
-    st.title("个人投资者股票决策辅助 Agent V4.1")
-    st.caption("真实公开数据 · 自动选择历史样本 · 用户适配与当前时点分开判断 · 教学研究原型")
-    step = st.session_state.step
-    labels = ["① 选择股票", "② 个人情况", "③ 自动分析与结果"]
-    columns = st.columns(3)
-    for index, (column, label) in enumerate(zip(columns, labels), start=1):
-        prefix = "🟦" if index == step else "✅" if index < step else "⬜"
-        column.markdown(f"{prefix} **{label}**")
-    st.divider()
 
 
 def validate_code(market: str, code: str) -> str:
@@ -130,120 +89,284 @@ def cached_macro(market: str, benchmark: pd.DataFrame) -> EvidenceSnapshot:
     return fetch_macro_snapshot(market, benchmark)
 
 
-def page_one() -> None:
-    st.subheader("第一步：选择要判断的真实股票")
-    st.markdown(
-        '<div class="hero-card">只输入市场和股票代码。Agent会自行获取最大可得历史，不需要上传Excel，也不能手工挑选一段有利行情。</div>',
-        unsafe_allow_html=True,
+def initialize_v5_state() -> None:
+    defaults = {
+        "view": "analysis",
+        "user_data_loaded": False,
+        "profile_record": None,
+        "saved_profile": None,
+        "draft_record": None,
+        "question_answers": {},
+        "question_index": 0,
+        "questionnaire_mode": "first",
+        "confirm_profile_change": False,
+        "confirmed_market": None,
+        "confirmed_stock_code": None,
+        "confirmed_holding_state": "尚未持有",
+        "confirmed_cost_price": 0.0,
+        "confirmed_current_market_value": 0.0,
+        "analysis_request_token": 0,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+    if st.session_state.view == "analysis":
+        widget_defaults = {
+            "v5_market": "A股",
+            "v5_stock_code": "",
+            "v5_holding_state": "尚未持有",
+            "v5_cost_price": 0.0,
+            "v5_current_value": 0.0,
+            "v5_planned_amount": 50_000.0,
+            "v5_leverage": "否",
+        }
+        for key, value in widget_defaults.items():
+            if key not in st.session_state:
+                st.session_state[key] = value
+
+
+def _session_load_profile() -> dict | None:
+    return st.session_state.get("dev_profile_record")
+
+
+def _session_load_draft() -> dict | None:
+    return st.session_state.get("dev_draft_record")
+
+
+def persist_draft(answers: dict, current_index: int) -> None:
+    st.session_state.dev_draft_record = {
+        "answers": dict(answers),
+        "current_index": int(current_index),
+        "updated_at": datetime.now().isoformat(),
+    }
+
+
+def remove_draft() -> None:
+    st.session_state.pop("dev_draft_record", None)
+
+
+def persist_profile(profile: dict, risk_score: int, risk_level: str, version: int) -> dict:
+    record = {
+        "profile_data": dict(profile),
+        "risk_score": int(risk_score),
+        "risk_level": risk_level,
+        "version": int(version) + 1,
+        "completed_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+    }
+    st.session_state.dev_profile_record = record
+    return record
+
+
+def load_current_user_data() -> None:
+    if st.session_state.user_data_loaded:
+        return
+    profile_record = _session_load_profile()
+    draft_record = _session_load_draft()
+    st.session_state.profile_record = profile_record
+    st.session_state.saved_profile = profile_record.get("profile_data") if profile_record else None
+    st.session_state.draft_record = draft_record
+    st.session_state.question_answers = dict((draft_record or {}).get("answers") or {})
+    st.session_state.question_index = int((draft_record or {}).get("current_index") or first_unanswered_index(st.session_state.question_answers))
+    if not profile_record:
+        st.session_state.questionnaire_mode = "first"
+        st.session_state.view = "questionnaire"
+    st.session_state.user_data_loaded = True
+
+
+def render_brand(subtitle: str = "") -> None:
+    st.markdown('<div class="app-brand">Five-year evidence · Personal suitability</div>', unsafe_allow_html=True)
+    st.title("个人投资者股票决策辅助 Agent｜简化部署版")
+    st.caption(subtitle or "近五年真实公开行情 · 当前会话风险测评 · 多周期风险判断 · 教学研究原型")
+
+
+def question_option_label(option: str, current: str | None) -> str:
+    return f"✓ 当前答案　{option}" if option == current else option
+
+
+def questionnaire_page() -> None:
+    answers = dict(st.session_state.question_answers)
+    index = int(st.session_state.question_index)
+    total = len(QUESTIONS)
+    render_brand("本次网页会话首次测评提交后，日常换股不会再次要求填写")
+    if index < total:
+        question = QUESTIONS[index]
+        st.progress((index + 1) / total, text=f"第 {index + 1} / {total} 题")
+        st.markdown(
+            f'<div class="question-card"><div class="muted">个人风险测评</div><h2>{question["title"]}</h2><p class="muted">{question["hint"]}</p></div>',
+            unsafe_allow_html=True,
+        )
+        current_answer = answers.get(question["key"])
+        for option_index, option in enumerate(question["options"]):
+            if st.button(
+                question_option_label(str(option), current_answer),
+                key=f"answer_{index}_{option_index}",
+                width="stretch",
+                type="primary" if option == current_answer else "secondary",
+            ):
+                updated = dict(answers)
+                updated[str(question["key"])] = str(option)
+                next_index = index + 1
+                persist_draft(updated, next_index)
+                st.session_state.question_answers = updated
+                st.session_state.question_index = next_index
+                st.rerun()
+        st.divider()
+        if st.button("← 返回上一页", disabled=index == 0, key=f"question_back_{index}"):
+            st.session_state.question_index = max(0, index - 1)
+            st.rerun()
+        return
+
+    st.progress(1.0, text=f"已完成 {total} / {total} 题")
+    st.subheader("确认并提交风险测评")
+    if not answers_complete(answers):
+        st.warning("仍有问题未完成，系统将返回第一道未完成的问题。")
+        if st.button("返回继续填写", type="primary"):
+            st.session_state.question_index = first_unanswered_index(answers)
+            st.rerun()
+        return
+    review = pd.DataFrame(
+        [[item["title"], answers[item["key"]]] for item in QUESTIONS],
+        columns=["问题", "你的选择"],
     )
+    st.dataframe(review, hide_index=True, width="stretch")
+    back, submit = st.columns([1, 2])
+    if back.button("← 返回上一页", width="stretch"):
+        st.session_state.question_index = total - 1
+        st.rerun()
+    if submit.button("确认提交并生成风险等级", type="primary", width="stretch"):
+        try:
+            profile = answers_to_profile(answers)
+            risk_score, _, risk_level, _, _ = score_investor(profile)
+            version = int((st.session_state.profile_record or {}).get("version") or 0)
+            record = persist_profile(profile, risk_score, risk_level, version)
+            remove_draft()
+            st.session_state.profile_record = record
+            st.session_state.saved_profile = profile
+            st.session_state.draft_record = None
+            st.session_state.question_answers = {}
+            st.session_state.question_index = 0
+            st.session_state.view = "analysis"
+            st.session_state.confirm_profile_change = False
+            st.rerun()
+        except ValueError as exc:
+            st.error(f"提交失败：{exc}")
+
+
+def v5_market_changed() -> None:
+    st.session_state.v5_stock_code = ""
+
+
+def analysis_home() -> None:
+    profile = st.session_state.saved_profile
+    record = st.session_state.profile_record or {}
+    render_brand("风险资料已在本次网页会话中生效；日常只需更换股票并填写本次投资信息")
+    risk_cols = st.columns([1, 1, 1.4])
+    risk_cols[0].metric("个人风险等级", record.get("risk_level", "—"), f"{record.get('risk_score', '—')}/100")
+    risk_cols[1].metric("测评版本", f"第 {record.get('version', 1)} 版")
+    risk_cols[2].metric("资产范围", profile.get("asset_band", "—"))
+    st.markdown('<div class="hero-card"><b>选择本次要分析的股票</b><br><span class="muted">Agent统一使用最近五年行情；上市不足五年时使用全部可得数据并降低结论置信度。</span></div>', unsafe_allow_html=True)
+    st.caption("提示：本版不注册账号。关闭网页、清除浏览器数据或更换设备后，需要重新完成风险测评。")
+
     left, right = st.columns([1, 1])
     with left:
-        st.radio("市场", ["A股", "美股"], horizontal=True, key="market_input", on_change=market_changed)
-        help_text = "例如：000001、600519、300750" if st.session_state.market_input == "A股" else "例如：AAPL、MSFT、NVDA、BRK-B"
-        placeholder = "请输入6位A股代码" if st.session_state.market_input == "A股" else "请输入美股代码"
-        st.text_input("股票代码", key="stock_code_input", placeholder=placeholder, help=help_text)
+        st.radio("市场", ["A股", "美股"], horizontal=True, key="v5_market", on_change=v5_market_changed)
+        placeholder = "例如：600519、300750" if st.session_state.v5_market == "A股" else "例如：AAPL、MSFT、NVDA"
+        st.text_input("股票代码", key="v5_stock_code", placeholder=placeholder)
+        st.number_input("本次计划总投资／持仓金额（折合人民币元）", min_value=1000.0, step=1000.0, key="v5_planned_amount")
     with right:
-        st.radio("目前是否已经持有这只股票？", ["尚未持有", "已经持有"], horizontal=True, key="holding_state_input")
-        if st.session_state.holding_state_input == "已经持有":
-            unit = "元/股" if st.session_state.market_input == "A股" else "美元/股"
-            st.number_input(f"持仓成本价（{unit}，可填0表示未知）", min_value=0.0, step=0.01, key="cost_price_input")
-            st.number_input("当前持仓市值（折合人民币元）", min_value=0.0, step=1000.0, key="current_market_value_input")
+        st.radio("目前是否已经持有？", ["尚未持有", "已经持有"], horizontal=True, key="v5_holding_state")
+        if st.session_state.v5_holding_state == "已经持有":
+            unit = "元/股" if st.session_state.v5_market == "A股" else "美元/股"
+            st.number_input(f"持仓成本价（{unit}，可填0表示未知）", min_value=0.0, step=0.01, key="v5_cost_price")
+            st.number_input("当前持仓市值（折合人民币元）", min_value=0.0, step=1000.0, key="v5_current_value")
+        st.radio("本次是否计划使用融资或其他杠杆？", ["否", "是"], horizontal=True, key="v5_leverage")
 
-    st.info("V4.1不会要求选择历史开始日、结束日或计划持有期；持有周期由Agent根据个人约束和多周期信号判断。")
-    if st.button("下一步：填写个人情况", type="primary", width="stretch"):
+    if st.button("获取近五年真实数据并分析", type="primary", width="stretch"):
         try:
-            confirmed_code = validate_code(st.session_state.market_input, st.session_state.stock_code_input)
-            st.session_state.confirmed_market = st.session_state.market_input
-            st.session_state.confirmed_stock_code = confirmed_code
-            st.session_state.confirmed_holding_state = st.session_state.holding_state_input
-            st.session_state.confirmed_cost_price = float(st.session_state.get("cost_price_input", 0.0))
-            st.session_state.confirmed_current_market_value = float(st.session_state.get("current_market_value_input", 0.0))
+            code = validate_code(st.session_state.v5_market, st.session_state.v5_stock_code)
+            planned = float(st.session_state.v5_planned_amount)
+            asset_upper = profile.get("asset_upper")
+            if asset_upper is not None and planned > float(asset_upper):
+                raise ValueError("本次计划金额高于风险问卷所选资产范围上限，请先到个人中心更新资料。")
+            st.session_state.confirmed_market = st.session_state.v5_market
+            st.session_state.confirmed_stock_code = code
+            st.session_state.confirmed_holding_state = st.session_state.v5_holding_state
+            st.session_state.confirmed_cost_price = float(st.session_state.get("v5_cost_price", 0.0))
+            st.session_state.confirmed_current_market_value = float(st.session_state.get("v5_current_value", 0.0))
+            st.session_state.profile = compose_analysis_profile(profile, planned, st.session_state.v5_leverage)
             st.session_state.analysis_request_token += 1
-            st.cache_data.clear()
-            st.session_state.step = 2
+            st.session_state.view = "result"
             st.rerun()
         except ValueError as exc:
             st.error(str(exc))
 
 
-def build_profile() -> dict:
-    return {
-        "planned_amount": float(st.session_state.planned_amount),
-        "investable_assets": float(st.session_state.investable_assets),
-        "fund_source": st.session_state.fund_source,
-        "emergency_reserve": st.session_state.emergency_reserve,
-        "earliest_need": st.session_state.earliest_need,
-        "income_stability": st.session_state.income_stability,
-        "loss_response": st.session_state.loss_response,
-        "goal": st.session_state.goal,
-        "experience": st.session_state.experience,
-        "trade_frequency": st.session_state.trade_frequency,
-        "monitor_time": st.session_state.monitor_time,
-        "existing_concentration": st.session_state.existing_concentration,
-        "stop_loss": st.session_state.get("stop_loss", "不适用"),
-        "leverage": st.session_state.get("leverage", "否"),
-        "fundamental_action": st.session_state.get("fundamental_action", "会重新评估"),
-        "fx_acceptance": st.session_state.get("fx_acceptance", "不确定"),
-    }
+def personal_center() -> None:
+    profile = st.session_state.saved_profile
+    record = st.session_state.profile_record or {}
+    render_brand("个人中心")
+    cols = st.columns(4)
+    cols[0].metric("当前风险等级", record.get("risk_level", "—"))
+    cols[1].metric("风险分", f"{record.get('risk_score', '—')}/100")
+    cols[2].metric("资料版本", f"第 {record.get('version', 1)} 版")
+    updated = str(record.get("updated_at") or record.get("completed_at") or "")[:10]
+    cols[3].metric("最近更新", updated or "—")
+    st.subheader("本次网页会话的风险资料")
+    st.dataframe(pd.DataFrame(public_profile_rows(profile), columns=["项目", "当前选择"]), hide_index=True, width="stretch")
 
-
-def page_two() -> None:
-    confirmed_market, confirmed_code = ensure_confirmed_stock()
-    st.subheader("第二步：填写个人情况")
-    st.info(f"本次确认分析：{confirmed_market}｜{confirmed_code}")
-    st.caption("不需要填写姓名、身份证、银行卡或联系方式，页面不会主动保存这些信息。")
-    left, right = st.columns(2)
-    with left:
-        amount_label = "计划投资金额（人民币元）" if st.session_state.confirmed_holding_state == "尚未持有" else "计划总持仓金额（含已有持仓，折合人民币元）"
-        st.number_input(amount_label, min_value=1000.0, value=50000.0, step=1000.0, key="planned_amount")
-        st.number_input("可用于投资的金融资产（人民币元）", min_value=1000.0, value=200000.0, step=10000.0, key="investable_assets")
-        st.selectbox("这笔钱主要来自哪里？", ["闲置自有资金", "未来有明确用途的资金", "应急资金", "借款／融资资金"], key="fund_source")
-        st.selectbox("目前预留的生活应急资金", ["不足3个月", "3—6个月", "6个月以上"], index=1, key="emergency_reserve")
-        st.selectbox("这笔资金最早什么时候可能需要使用？", ["1周内", "1个月内", "3个月内", "1年内", "3年内", "没有明确时间"], index=3, key="earliest_need")
-        st.selectbox("收入稳定性", ["不稳定", "较稳定", "稳定"], index=1, key="income_stability")
-    with right:
-        st.selectbox(
-            "假设10万元下跌到8万元，你更可能怎么做？",
-            ["立即全部卖出", "大部分减仓", "先复核原因再决定", "继续按原计划持有", "在条件允许时分批增加"],
-            index=2,
-            key="loss_response",
-        )
-        st.selectbox("主要投资目标", ["保值为主", "股息／稳健收益", "长期增值", "波段操作", "短线交易"], index=2, key="goal")
-        st.selectbox("股票投资经验", ["没有经验", "不足1年", "1—3年", "3年以上"], index=1, key="experience")
-        st.selectbox("通常交易频率", ["几乎不交易", "每月1—3次", "每周1—3次", "几乎每天"], index=1, key="trade_frequency")
-        st.selectbox("每天可用于查看行情的时间", ["不足15分钟", "15—30分钟", "30—60分钟", "1小时以上"], index=1, key="monitor_time")
-        st.selectbox("现有投资中最高的单只股票仓位", ["目前没有股票持仓", "不足10%", "10%—30%", "30%—50%", "超过50%"], key="existing_concentration")
-
-    st.markdown("#### Agent追加问题")
-    adaptive_left, adaptive_right = st.columns(2)
-    if st.session_state.goal in {"短线交易", "波段操作"} or st.session_state.trade_frequency in {"每周1—3次", "几乎每天"}:
-        with adaptive_left:
-            st.selectbox("是否有明确并能执行的止损／退出规则？", ["有明确规则并能执行", "有规则但经常改变", "没有明确规则"], key="stop_loss")
-        with adaptive_right:
-            st.radio("是否计划使用融资或其他杠杆？", ["否", "是"], horizontal=True, key="leverage")
-    else:
-        with adaptive_left:
-            st.selectbox("如果公司基本面发生明显恶化，你会怎么做？", ["会重新评估", "仍长期持有而不复核", "不确定如何判断"], key="fundamental_action")
-        with adaptive_right:
-            st.info("长期持有不等于永不复核。Agent会给出财报和投资逻辑复查节点。")
-    if confirmed_market == "美股":
-        st.selectbox("能否接受人民币兑美元波动影响最终收益？", ["能够接受", "只能接受较小波动", "不确定"], key="fx_acceptance")
-
-    planned_ratio = st.session_state.planned_amount / max(st.session_state.investable_assets, 1)
-    st.caption(f"目前填写的计划金额约占可投资金融资产的 {planned_ratio:.1%}。这只是风险集中度计算，不代表建议仓位。")
-    back, submit = st.columns([1, 2])
-    if back.button("返回选择股票", width="stretch"):
-        restore_confirmed_inputs()
-        st.rerun()
-    if submit.button(f"获取 {confirmed_code} 真实数据并分析", type="primary", width="stretch"):
-        if st.session_state.planned_amount > st.session_state.investable_assets:
-            st.error("计划投入金额不能大于可投资金融资产。请先检查这两个数字。")
-        elif st.session_state.confirmed_holding_state == "已经持有" and st.session_state.confirmed_current_market_value > st.session_state.investable_assets:
-            st.error("当前持仓市值不能大于填写的可投资金融资产，请检查口径是否一致。")
-        else:
-            st.session_state.profile = build_profile()
-            st.session_state.step = 3
+    if st.session_state.draft_record:
+        st.info("你有一份尚未提交的新测评草稿。旧资料仍然有效。")
+        continue_col, discard_col = st.columns(2)
+        if continue_col.button("继续填写草稿", width="stretch"):
+            st.session_state.question_answers = dict(st.session_state.draft_record.get("answers") or {})
+            st.session_state.question_index = int(st.session_state.draft_record.get("current_index") or 0)
+            st.session_state.questionnaire_mode = "update"
+            st.session_state.view = "questionnaire"
             st.rerun()
+        if discard_col.button("放弃草稿", width="stretch"):
+            remove_draft()
+            st.session_state.draft_record = None
+            st.rerun()
+
+    st.divider()
+    if st.button("更改个人信息", type="primary"):
+        st.session_state.confirm_profile_change = True
+    if st.session_state.confirm_profile_change:
+        st.warning("重新填写期间旧资料继续有效；只有完整提交新问卷后才会替换当前资料。")
+        cancel, confirm = st.columns(2)
+        if cancel.button("取消", width="stretch"):
+            st.session_state.confirm_profile_change = False
+            st.rerun()
+        if confirm.button("确认重置并重新测评", type="primary", width="stretch"):
+            persist_draft({}, 0)
+            st.session_state.question_answers = {}
+            st.session_state.question_index = 0
+            st.session_state.questionnaire_mode = "update"
+            st.session_state.view = "questionnaire"
+            st.session_state.confirm_profile_change = False
+            st.rerun()
+
+
+def clear_stock_widgets() -> None:
+    for key in ["v5_market", "v5_stock_code", "v5_holding_state", "v5_cost_price", "v5_current_value", "v5_planned_amount", "v5_leverage"]:
+        st.session_state.pop(key, None)
+    st.session_state.view = "analysis"
+
+
+def app_sidebar() -> None:
+    with st.sidebar:
+        st.markdown("### 📊 股票决策辅助 Agent")
+        record = st.session_state.profile_record or {}
+        st.caption(record.get("risk_level", "风险资料未完成"))
+        if st.button("股票分析", width="stretch"):
+            st.session_state.view = "analysis"
+            st.rerun()
+        if st.button("个人中心", width="stretch"):
+            st.session_state.view = "profile"
+            st.rerun()
+        st.divider()
+        st.caption("行情统一使用最近五年；新股使用上市以来全部可得数据并标注低置信度。")
 
 
 def pct(value: float | None, digits: int = 1) -> str:
@@ -301,7 +424,7 @@ def render_price_charts(bundle, analysis) -> None:
 
     drawdown = metrics["drawdown"]
     drawdown_fig = go.Figure(go.Scatter(x=drawdown.index, y=drawdown, fill="tozeroy", line=dict(color="#dc2626"), name="回撤"))
-    drawdown_fig.update_layout(title="全部可得历史回撤", height=340, margin=dict(l=20, r=20, t=55, b=20), yaxis_tickformat=".0%")
+    drawdown_fig.update_layout(title="近五年或上市以来回撤", height=340, margin=dict(l=20, r=20, t=55, b=20), yaxis_tickformat=".0%")
     st.plotly_chart(drawdown_fig, width="stretch")
 
 
@@ -313,7 +436,7 @@ def render_summary(bundle, analysis, profile) -> None:
     columns[1].metric("用户类型", analysis["style"])
     columns[2].metric("股票风险等级", analysis["stock_risk_level"], f"{analysis['stock_risk_score']}/100")
     columns[3].metric("个人适配", analysis["suitability"]["fit"])
-    columns[4].metric("数据可信度", f"{analysis['data_confidence']}%")
+    columns[4].metric("数据完整度", f"{analysis['data_confidence']}%")
 
     left, right = st.columns(2)
     with left:
@@ -380,8 +503,8 @@ def render_risk_budget(analysis, profile) -> None:
     table = pd.DataFrame(
         [
             ["计划投资金额", f"{profile['planned_amount']:,.0f} 元"],
-            ["可投资金融资产", f"{profile['investable_assets']:,.0f} 元"],
-            ["计划集中度", f"{profile['planned_amount'] / profile['investable_assets']:.1%}"],
+            ["可投资金融资产", profile.get("asset_band", f"约 {profile['investable_assets']:,.0f} 元")],
+            ["计划集中度（按区间代表值估算）", f"{profile['planned_amount'] / profile['investable_assets']:.1%}"],
             ["资金来源", profile["fund_source"]],
             ["最早用款时间", profile["earliest_need"]],
             ["用户风险等级", analysis["investor_level"]],
@@ -398,7 +521,7 @@ def render_risk_budget(analysis, profile) -> None:
         stress_cols[0].metric("相同周期较差情景（5%分位）", pct(-stress) if stress is not None else "数据不足")
         stress_cols[1].metric("相同周期历史最差一次", pct(selected.get("historical_worst")))
         stress_cols[2].metric("全部历史最大回撤", pct(analysis["metrics"]["max_drawdown"]))
-        st.info("历史最差值用于压力提示，不再做一票否决。仓位上限主要使用较差情景、用户风险预算和集中度共同计算。")
+        st.info("近五年或上市以来的较差情景用于压力提示，不做一票否决。仓位上限由压力情景、用户风险预算和集中度共同计算。")
 
 
 def render_horizons(analysis) -> None:
@@ -467,7 +590,7 @@ def render_professional(bundle, analysis) -> None:
         ["最新价格", f"{metrics['latest_price']:.2f} {bundle.price_unit}"],
         ["近一年年化波动率", pct(metrics["annual_volatility"])],
         ["下行波动率", pct(metrics["downside_volatility"])],
-        ["全部历史最大回撤", pct(metrics["max_drawdown"])],
+        ["近五年或上市以来最大回撤", pct(metrics["max_drawdown"])],
         ["单日95%历史VaR", pct(metrics["var95_daily"])],
         ["Beta", number(metrics["beta"])],
         ["与市场相关性", number(metrics["correlation"])],
@@ -491,15 +614,14 @@ def render_professional(bundle, analysis) -> None:
 def page_three() -> None:
     confirmed_market, confirmed_code = ensure_confirmed_stock()
     profile = st.session_state.profile
-    st.subheader(f"第三步：Agent自动获取 {confirmed_code} 数据并分析")
+    render_brand(f"正在分析 {confirmed_market}｜{confirmed_code}")
+    st.subheader(f"Agent自动获取 {confirmed_code} 近五年数据并分析")
     with st.status("正在完成自动分析……", expanded=True) as status:
         try:
-            status.write("1/4 获取股票的最大可得公开历史行情")
+            status.write("1/4 获取股票最近五年或上市以来全部可得行情")
             bundle = cached_price_bundle(confirmed_market, confirmed_code, st.session_state.analysis_request_token)
             if str(bundle.code).upper() != confirmed_code.upper():
                 raise RuntimeError(f"股票代码校验失败：请求 {confirmed_code}，数据源返回 {bundle.code}。已停止分析，避免使用错误股票数据。")
-            if len(bundle.stock) < 40:
-                raise RuntimeError(f"该证券只取得{len(bundle.stock)}个交易日，暂不足以进行基本风险分析。")
             status.write("2/4 获取基准、公司财务和估值信息")
             last_price = float(bundle.stock["收盘"].iloc[-1])
             fundamental = cached_fundamentals(confirmed_market, bundle.code, round(last_price, 6), bundle.asset_type)
@@ -522,17 +644,22 @@ def page_three() -> None:
             )
             cols = st.columns(2)
             if cols[0].button("返回修改股票", width="stretch"):
-                restore_confirmed_inputs()
+                st.session_state.view = "analysis"
                 st.rerun()
-            if cols[1].button("返回修改个人情况", width="stretch"):
-                st.session_state.step = 2
+            if cols[1].button("前往个人中心", width="stretch"):
+                st.session_state.view = "profile"
                 st.rerun()
             st.stop()
 
     full_first = bundle.stock["日期"].min().date()
     full_last = bundle.stock["日期"].max().date()
-    st.success(f"{bundle.code}｜{bundle.name}｜{bundle.asset_type}｜已取得 {full_first} 至 {full_last}，共 {len(bundle.stock)} 个交易日。")
+    st.success(f"{bundle.code}｜{bundle.name}｜{bundle.asset_type}｜分析区间 {full_first} 至 {full_last}，共 {len(bundle.stock)} 个交易日。")
     st.caption(f"行情来源：{bundle.provider}；基准：{bundle.benchmark_name}；数据以最近公开返回为准，可能延迟、缺失或调整。")
+    if not bundle.history_complete:
+        st.warning("该股票可得历史不足五年。数据不足，无法准确判断，分析结果仅作低置信度参考。")
+    for warning in bundle.warnings:
+        if "不足五年" not in warning:
+            st.info(warning)
 
     view_mode = st.radio("结果显示", ["简明模式", "专业模式"], horizontal=True, help="两种模式使用同一套计算结果，只改变解释深度。")
     tab_names = ["结论", "风险与仓位", "持有周期", "数据证据"]
@@ -555,10 +682,10 @@ def page_three() -> None:
     st.warning("本程序是学习和内部研究原型，不是中国建设银行正式产品，不构成投资建议，不预测确定收益，也不会代替持牌机构的适当性管理和人工审核。")
     left, middle, right = st.columns(3)
     if left.button("换一只股票", width="stretch"):
-        start_new_stock()
+        clear_stock_widgets()
         st.rerun()
-    if middle.button("修改个人情况", width="stretch"):
-        st.session_state.step = 2
+    if middle.button("个人中心", width="stretch"):
+        st.session_state.view = "profile"
         st.rerun()
     if right.button("刷新公开数据", width="stretch"):
         st.cache_data.clear()
@@ -566,22 +693,19 @@ def page_three() -> None:
         st.rerun()
 
 
-initialize_state()
-render_header()
-with st.sidebar:
-    st.header("V4.1的关键变化")
-    st.write("- 面向所有个人股民，按用户自动分层")
-    st.write("- 用户不选择历史区间或持有周期")
-    st.write("- 个人适配与当前时点分别判断")
-    st.write("- 历史最差值不再一票否决")
-    st.write("- 免费数据失败时明确说明，不生成假结果")
-    st.write("- 输入代码与确认代码分离，防止切换后恢复默认股票")
-    st.divider()
-    st.caption("当前步骤中的回答只在本次页面会话中用于计算。")
+initialize_v5_state()
+load_current_user_data()
 
-if st.session_state.step == 1:
-    page_one()
-elif st.session_state.step == 2:
-    page_two()
-else:
+if st.session_state.saved_profile:
+    app_sidebar()
+if not st.session_state.saved_profile:
+    st.session_state.view = "questionnaire"
+
+if st.session_state.view == "questionnaire":
+    questionnaire_page()
+elif st.session_state.view == "profile":
+    personal_center()
+elif st.session_state.view == "result":
     page_three()
+else:
+    analysis_home()

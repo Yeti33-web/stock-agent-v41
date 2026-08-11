@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from io import StringIO
 import os
+import time
 from typing import Any
 
 import numpy as np
@@ -26,7 +27,7 @@ except ImportError:
     yf = None
 
 
-AUTO_FETCH_START = {"A股": "1990-01-01", "美股": "1970-01-01"}
+HISTORY_YEARS = 5
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 StockResearchAgent/4.0"}
 SEC_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "IndividualInvestorResearchAgent/4.0 educational-use")}
 
@@ -109,6 +110,10 @@ class PriceBundle:
     asset_type: str
     price_unit: str
     warnings: list[str] = field(default_factory=list)
+    requested_start: str = ""
+    requested_end: str = ""
+    history_complete: bool = True
+    coverage_ratio: float = 1.0
 
 
 @dataclass
@@ -279,10 +284,29 @@ def fetch_yfinance_history(symbol: str, start_text: str, end_text: str) -> pd.Da
     return standardize_english_ohlcv(raw)
 
 
+def _get_with_retry(url: str, *, params: dict[str, Any] | None = None, timeout: int = 20) -> requests.Response:
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            response = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=timeout)
+            if response.status_code == 429 or 500 <= response.status_code < 600:
+                last_error = RuntimeError(f"HTTP {response.status_code}")
+                if attempt < 2:
+                    time.sleep(0.6 * (2**attempt))
+                    continue
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.6 * (2**attempt))
+    raise RuntimeError(f"公开行情接口连续重试后仍失败：{last_error}")
+
+
 def fetch_yahoo_chart_history(symbol: str, start_text: str, end_text: str) -> tuple[pd.DataFrame, str]:
     period1 = int(pd.Timestamp(start_text, tz="UTC").timestamp())
     period2 = int((pd.Timestamp(end_text, tz="UTC") + pd.Timedelta(days=1)).timestamp())
-    response = requests.get(
+    response = _get_with_retry(
         f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
         params={
             "period1": period1,
@@ -291,10 +315,8 @@ def fetch_yahoo_chart_history(symbol: str, start_text: str, end_text: str) -> tu
             "events": "history",
             "includeAdjustedClose": "true",
         },
-        headers=HTTP_HEADERS,
         timeout=20,
     )
-    response.raise_for_status()
     payload = response.json().get("chart", {})
     if payload.get("error"):
         raise RuntimeError(str(payload["error"]))
@@ -323,6 +345,24 @@ def fetch_yahoo_chart_history(symbol: str, start_text: str, end_text: str) -> tu
     meta = result.get("meta", {})
     name = str(meta.get("longName") or meta.get("shortName") or symbol)
     return clean_ohlcv(frame), name
+
+
+def fetch_stooq_history(symbol: str, start_text: str, end_text: str) -> pd.DataFrame:
+    normalized = normalize_us_code(symbol).lower().replace("-", ".")
+    response = _get_with_retry(
+        "https://stooq.com/q/d/l/",
+        params={
+            "s": f"{normalized}.us",
+            "d1": start_text.replace("-", ""),
+            "d2": end_text.replace("-", ""),
+            "i": "d",
+        },
+        timeout=20,
+    )
+    if not response.text.strip() or response.text.lstrip().lower().startswith("no data"):
+        return pd.DataFrame()
+    raw = pd.read_csv(StringIO(response.text))
+    return standardize_english_ohlcv(raw)
 
 
 def fetch_akshare_us_history(symbol: str, start_text: str, end_text: str) -> tuple[pd.DataFrame, str]:
@@ -369,7 +409,10 @@ def fetch_us_security(symbol: str, start_text: str, end_text: str) -> tuple[pd.D
                 return candidates[-1]
     except Exception as exc:
         errors.append(f"Yahoo图表接口：{exc}")
-    for source_name, loader in [("yfinance备用日线（自动复权）", lambda: fetch_yfinance_history(code, start_text, end_text))]:
+    for source_name, loader in [
+        ("yfinance备用日线（自动复权）", lambda: fetch_yfinance_history(code, start_text, end_text)),
+        ("Stooq独立备用日线", lambda: fetch_stooq_history(code, start_text, end_text)),
+    ]:
         try:
             data = loader()
             if not data.empty:
@@ -506,6 +549,7 @@ def fetch_us_benchmark(start_text: str, end_text: str) -> pd.DataFrame:
         pass
     for loader in (
         lambda: fetch_yfinance_history("SPY", start_text, end_text),
+        lambda: fetch_stooq_history("SPY", start_text, end_text),
     ):
         try:
             data = loader()
@@ -805,6 +849,14 @@ def fetch_us_fundamentals(symbol: str, last_price: float | None = None) -> Evide
 
 
 def derive_market_regime(benchmark: pd.DataFrame) -> dict[str, Any]:
+    if benchmark is None or benchmark.empty:
+        return {
+            "市场状态": "基准数据暂不可用",
+            "市场分": 50,
+            "近60日收益": np.nan,
+            "近250日收益": np.nan,
+            "近60日年化波动": np.nan,
+        }
     close = benchmark.set_index("日期")["收盘"].sort_index()
     returns = close.pct_change().dropna()
     ma60 = close.rolling(60).mean().iloc[-1] if len(close) >= 60 else close.mean()
@@ -845,6 +897,8 @@ def fetch_macro_snapshot(market: str, benchmark: pd.DataFrame) -> EvidenceSnapsh
     fields: dict[str, Any] = dict(regime)
     notes: list[str] = []
     score = float(regime["市场分"])
+    if benchmark is None or benchmark.empty:
+        notes.append("市场基准暂未取得，宏观环境仅按中性处理，不影响个股行情继续分析。")
     if market == "A股" and ak is not None:
         try:
             raw = ak.macro_china_lpr()
@@ -888,18 +942,40 @@ def fetch_macro_snapshot(market: str, benchmark: pd.DataFrame) -> EvidenceSnapsh
 
 
 def fetch_price_bundle(market: str, raw_code: str) -> PriceBundle:
-    start_text = AUTO_FETCH_START[market]
     end_text = date.today().strftime("%Y-%m-%d")
+    start_text = (pd.Timestamp(end_text) - pd.DateOffset(years=HISTORY_YEARS)).strftime("%Y-%m-%d")
+    warnings: list[str] = []
     if market == "A股":
         code = normalize_a_code(raw_code)
         stock, name, provider = fetch_a_security(code, start_text, end_text)
-        benchmark = fetch_a_benchmark(start_text, end_text)
+        try:
+            benchmark = fetch_a_benchmark(start_text, end_text)
+        except Exception as exc:
+            benchmark = pd.DataFrame(columns=["日期", "开盘", "最高", "最低", "收盘", "成交量"])
+            warnings.append(f"沪深300基准暂不可用：{exc}")
         asset_type = "场内基金" if is_exchange_traded_fund_code(code) else "A股个股"
-        return PriceBundle(stock, benchmark, code, name, provider, "沪深300", asset_type, "人民币元")
-    code = normalize_us_code(raw_code)
-    stock, name, provider = fetch_us_security(code, start_text, end_text)
-    benchmark = fetch_us_benchmark(start_text, end_text)
-    return PriceBundle(stock, benchmark, code, name, provider, "标普500代理ETF（SPY）", "美股个股", "美元")
+        bundle = PriceBundle(stock, benchmark, code, name, provider, "沪深300", asset_type, "人民币元", warnings)
+    else:
+        code = normalize_us_code(raw_code)
+        stock, name, provider = fetch_us_security(code, start_text, end_text)
+        try:
+            benchmark = fetch_us_benchmark(start_text, end_text)
+        except Exception as exc:
+            benchmark = pd.DataFrame(columns=["日期", "开盘", "最高", "最低", "收盘", "成交量"])
+            warnings.append(f"标普500代理基准SPY暂不可用：{exc}")
+        bundle = PriceBundle(stock, benchmark, code, name, provider, "标普500代理ETF（SPY）", "美股个股", "美元", warnings)
+
+    first_date = pd.Timestamp(bundle.stock["日期"].min())
+    requested_start = pd.Timestamp(start_text)
+    expected_span = max(1, (pd.Timestamp(end_text) - requested_start).days)
+    actual_span = max(0, (pd.Timestamp(end_text) - first_date).days)
+    bundle.requested_start = start_text
+    bundle.requested_end = end_text
+    bundle.coverage_ratio = float(np.clip(actual_span / expected_span, 0, 1))
+    bundle.history_complete = bool(first_date <= requested_start + pd.Timedelta(days=45))
+    if not bundle.history_complete:
+        bundle.warnings.append("该股票可得历史不足五年。数据不足，无法准确判断，结果仅作低置信度参考。")
+    return bundle
 
 
 def calculate_quant_metrics(stock: pd.DataFrame, benchmark: pd.DataFrame) -> dict[str, Any]:
@@ -908,8 +984,12 @@ def calculate_quant_metrics(stock: pd.DataFrame, benchmark: pd.DataFrame) -> dic
     returns = close.pct_change().dropna()
     drawdown = close / close.cummax() - 1
     recent_returns = returns.tail(min(252, len(returns)))
-    benchmark_close = benchmark.set_index("日期")["收盘"].sort_index()
-    benchmark_returns = benchmark_close.pct_change().dropna()
+    if benchmark is None or benchmark.empty:
+        benchmark_close = pd.Series(dtype="float64", name="收盘")
+        benchmark_returns = pd.Series(dtype="float64")
+    else:
+        benchmark_close = benchmark.set_index("日期")["收盘"].sort_index()
+        benchmark_returns = benchmark_close.pct_change().dropna()
     aligned = pd.concat([returns.rename("stock"), benchmark_returns.rename("benchmark")], axis=1).dropna().tail(756)
     beta = np.nan
     correlation = np.nan
@@ -964,7 +1044,7 @@ def score_stock_risk(metrics: dict[str, Any]) -> tuple[int, int, str, list[str]]
         level, level_number = "R4（中高风险）", 4
     else:
         level, level_number = "R5（高风险）", 5
-    reasons = [f"近一年年化波动率约{volatility:.1%}" if np.isfinite(volatility) else "波动率数据不足", f"全部可得历史最大回撤约{metrics['max_drawdown']:.1%}"]
+    reasons = [f"近一年年化波动率约{volatility:.1%}" if np.isfinite(volatility) else "波动率数据不足", f"近五年或上市以来最大回撤约{metrics['max_drawdown']:.1%}"]
     if beta > 1.2:
         reasons.append("相对市场的Beta较高")
     if metrics["abnormal_days"]:
@@ -973,19 +1053,15 @@ def score_stock_risk(metrics: dict[str, Any]) -> tuple[int, int, str, list[str]]
 
 
 def score_investor(profile: dict[str, Any]) -> tuple[int, int, str, str, list[str]]:
-    amount = float(profile["planned_amount"])
-    assets = max(float(profile["investable_assets"]), 1.0)
-    ratio = amount / assets
     source_points = {"闲置自有资金": 15, "未来有明确用途的资金": 8, "应急资金": 0, "借款／融资资金": 0}[profile["fund_source"]]
     reserve_points = {"不足3个月": 0, "3—6个月": 8, "6个月以上": 15}[profile["emergency_reserve"]]
     need_points = {"1周内": 0, "1个月内": 3, "3个月内": 7, "1年内": 12, "3年内": 15, "没有明确时间": 15}[profile["earliest_need"]]
-    concentration_points = 15 if ratio <= 0.05 else 12 if ratio <= 0.10 else 8 if ratio <= 0.20 else 4 if ratio <= 0.30 else 0
-    loss_points = {"立即全部卖出": 2, "大部分减仓": 7, "先复核原因再决定": 14, "继续按原计划持有": 20, "在条件允许时分批增加": 23}[profile["loss_response"]]
-    goal_points = {"保值为主": 0, "股息／稳健收益": 7, "长期增值": 13, "波段操作": 20, "短线交易": 24}[profile["goal"]]
-    willingness = round((loss_points + goal_points) / 2)
+    loss_points = {"立即全部卖出": 1, "大部分减仓": 4, "先复核原因再决定": 8, "继续按原计划持有": 11, "在条件允许时分批增加": 13}[profile["loss_response"]]
+    max_loss_points = {"不超过5%": 0, "5%—10%": 4, "10%—20%": 8, "20%—30%": 12, "超过30%": 15}[profile.get("max_loss", "10%—20%")]
+    goal_points = {"保值为主": 0, "股息／稳健收益": 3, "长期增值": 6, "波段操作": 8, "短线交易": 10}[profile["goal"]]
     stability_points = {"不稳定": 2, "较稳定": 7, "稳定": 10}[profile["income_stability"]]
     knowledge_points = {"没有经验": 0, "不足1年": 2, "1—3年": 4, "3年以上": 5}[profile["experience"]]
-    score = int(np.clip(source_points + reserve_points + need_points + concentration_points + willingness + stability_points + knowledge_points, 0, 100))
+    score = int(np.clip(source_points + reserve_points + need_points + loss_points + max_loss_points + goal_points + stability_points + knowledge_points, 0, 100))
     if score <= 25:
         level_number, level = 1, "C1（保守型）"
     elif score <= 45:
@@ -1011,8 +1087,8 @@ def score_investor(profile: dict[str, Any]) -> tuple[int, int, str, str, list[st
         flags.append("资金来源不适合承担单只股票波动")
     if profile["emergency_reserve"] == "不足3个月":
         flags.append("应急储备不足3个月")
-    if ratio > 0.30:
-        flags.append("计划投入超过可投资资产的30%，集中度较高")
+    if profile.get("existing_concentration") in {"30%—50%", "超过50%"}:
+        flags.append("现有投资的单只股票集中度较高")
     if profile.get("leverage") == "是":
         flags.append("计划使用杠杆会放大损失")
     return score, level_number, level, style, flags
@@ -1164,6 +1240,14 @@ def calculate_data_confidence(
     if metrics["abnormal_days"]:
         score -= min(10, metrics["abnormal_days"] * 2)
         notes.append("检测到极端日收益，可能包含公司事件或复权差异。")
+    if not metrics.get("history_complete", True):
+        rows = int(metrics.get("rows", 0))
+        cap = 30 if rows < 60 else 45 if rows < 250 else 65 if rows < 750 else 78
+        score = min(score, cap)
+        notes.append("该股票可得历史不足五年。数据不足，无法准确判断。")
+    if not metrics.get("benchmark_available", True):
+        score = min(score, 72)
+        notes.append("市场基准暂不可用，Beta和相对强弱未参与判断。")
     return int(np.clip(score, 0, 100)), notes
 
 
@@ -1257,6 +1341,9 @@ def analyze_all(
     macro: EvidenceSnapshot,
 ) -> dict[str, Any]:
     metrics = calculate_quant_metrics(bundle.stock, bundle.benchmark)
+    metrics["history_complete"] = bundle.history_complete
+    metrics["coverage_ratio"] = bundle.coverage_ratio
+    metrics["benchmark_available"] = bundle.benchmark is not None and not bundle.benchmark.empty
     investor_score, investor_number, investor_level, style, profile_flags = score_investor(profile)
     stock_risk_score, stock_risk_number, stock_risk_level, risk_reasons = score_stock_risk(metrics)
     horizon_scores = score_horizons(metrics, fundamental, macro)
