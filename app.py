@@ -32,10 +32,18 @@ from questionnaire import (
     first_unanswered_index,
     public_profile_rows,
 )
+from session_memory import (
+    append_note,
+    delete_session,
+    portfolio_from_sessions,
+    session_key,
+    set_invested_principal,
+    upsert_analysis_session,
+)
 
 
 st.set_page_config(
-    page_title="个人投资者股票决策辅助 Agent V5.6",
+    page_title="个人投资者股票决策辅助 Agent V5.8",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -55,6 +63,7 @@ st.markdown(
     div[data-testid="stMetric"] {border:1px solid #e4eaf2; padding:.9rem; border-radius:14px; background:white; box-shadow:0 5px 15px rgba(16,24,40,.035);}
     div.stButton > button {border-radius:12px; min-height:2.8rem;}
     div[data-testid="stForm"] {border:1px solid #e4eaf2; border-radius:18px; padding:1.25rem; background:white;}
+    div[data-testid="stChatMessage"] {border:1px solid #e4eaf2; border-radius:16px; background:white; padding:.25rem .55rem;}
     [data-testid="stSidebar"] {background:#f7f9fc;}
     </style>
     """,
@@ -136,6 +145,10 @@ def initialize_v5_state() -> None:
         "confirmed_additional_amount": 0.0,
         "holding_snapshot": None,
         "analysis_request_token": 0,
+        "confirmed_analysis_id": "",
+        "stock_sessions": {},
+        "selected_session_key": None,
+        "pending_delete_session": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -211,7 +224,7 @@ def load_current_user_data() -> None:
 
 def render_brand(subtitle: str = "") -> None:
     st.markdown('<div class="app-brand">Five-year evidence · Personal suitability</div>', unsafe_allow_html=True)
-    st.title("个人投资者股票决策辅助 Agent｜持仓卖出信号版 V5.6")
+    st.title("个人投资者股票决策辅助 Agent｜股票会话记忆版 V5.8")
     st.caption(subtitle or "近五年真实公开行情 · 历史相似状态检索 · 个人风险适配 · 教学研究原型")
 
 
@@ -436,6 +449,7 @@ def analysis_home() -> None:
             st.session_state.holding_snapshot = None
             st.session_state.profile = compose_analysis_profile(profile, planned, st.session_state.v5_leverage)
             st.session_state.analysis_request_token += 1
+            st.session_state.confirmed_analysis_id = datetime.now().isoformat(timespec="microseconds")
             st.session_state.view = "result"
             st.rerun()
         except ValueError as exc:
@@ -519,7 +533,192 @@ def app_sidebar() -> None:
             st.session_state.view = "profile"
             st.rerun()
         st.divider()
+        if st.button("💬 股票会话与组合", width="stretch", type="primary"):
+            st.session_state.selected_session_key = None
+            st.session_state.pending_delete_session = None
+            st.session_state.view = "sessions"
+            st.rerun()
+        sessions = st.session_state.get("stock_sessions") or {}
+        if sessions:
+            st.caption("已保存的股票会话")
+            ordered_sessions = sorted(
+                sessions.items(),
+                key=lambda item: str(item[1].get("updated_at") or ""),
+                reverse=True,
+            )
+            for index, (key, session) in enumerate(ordered_sessions):
+                code = session.get("code", "—")
+                name = session.get("name", "—")
+                principal = float(session.get("principal_rmb") or 0.0)
+                label = f"{code} · {name}"
+                if st.button(label, key=f"sidebar_session_{index}", width="stretch"):
+                    st.session_state.selected_session_key = key
+                    st.session_state.pending_delete_session = None
+                    st.session_state.view = "sessions"
+                    st.rerun()
+                st.caption(f"已记录本金：{principal:,.3f} 元")
+        else:
+            st.caption("完成一次股票分析后，会自动建立独立会话。")
+        st.divider()
         st.caption("行情统一使用最近五年；相似样本不足时拒绝预测；新股标注低置信度。")
+
+
+def render_session_portfolio() -> None:
+    sessions = st.session_state.get("stock_sessions") or {}
+    portfolio = portfolio_from_sessions(sessions)
+    st.subheader("会话组合持仓")
+    st.caption("此处是多只股票在会话组合内部的占比，不会改变原有单只股票风险预算和仓位判断。")
+    metric_cols = st.columns(3)
+    metric_cols[0].metric("保留的股票会话", str(portfolio["conversation_count"]))
+    metric_cols[1].metric("计入组合的股票", str(portfolio["position_count"]))
+    metric_cols[2].metric("已记录投入本金", money(portfolio["total_principal_rmb"]))
+
+    rows = portfolio["rows"]
+    if rows:
+        table_rows = [
+            {
+                "市场": item["market"],
+                "股票代码": item["code"],
+                "股票名称": item["name"],
+                "投入本金（人民币元）": f"{item['principal_rmb']:,.3f}",
+                "会话组合占比": f"{item['weight']:.3%}",
+            }
+            for item in rows
+        ]
+        left, right = st.columns([1.25, 1])
+        with left:
+            st.dataframe(pd.DataFrame(table_rows), hide_index=True, width="stretch")
+        with right:
+            figure = go.Figure(
+                data=[
+                    go.Pie(
+                        labels=[f"{item['code']} · {item['name']}" for item in rows],
+                        values=[item["principal_rmb"] for item in rows],
+                        hole=0.58,
+                        textinfo="label+percent",
+                        hovertemplate="%{label}<br>本金：%{value:,.3f} 元<br>占比：%{percent:.3%}<extra></extra>",
+                    )
+                ]
+            )
+            figure.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=340, showlegend=False)
+            st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
+    else:
+        st.info("当前没有已记录实际投入本金的股票。仅查询但尚未买入的会话仍会保留，但不会计入持仓占比。")
+
+    st.markdown("#### 全部股票会话")
+    if not sessions:
+        st.caption("暂无会话。请先进行一次股票分析。")
+        return
+    ordered_sessions = sorted(
+        sessions.items(),
+        key=lambda item: str(item[1].get("updated_at") or ""),
+        reverse=True,
+    )
+    weights = {item["key"]: item["weight"] for item in rows}
+    for index, (key, session) in enumerate(ordered_sessions):
+        cols = st.columns([4, 1.2, 1.2])
+        title = f"{session.get('code', '—')} · {session.get('name', '—')}（{session.get('market', '—')}）"
+        if cols[0].button(title, key=f"portfolio_session_{index}", width="stretch"):
+            st.session_state.selected_session_key = key
+            st.session_state.pending_delete_session = None
+            st.rerun()
+        cols[1].metric("投入本金", f"{float(session.get('principal_rmb') or 0.0):,.3f} 元")
+        cols[2].metric("组合占比", f"{weights.get(key, 0.0):.3%}" if key in weights else "未计入")
+
+
+def stock_session_page() -> None:
+    render_brand("每只股票独立留存分析记录；删除会话在业务上等价于该股票已全部卖出")
+    st.info("会话记录只保存在当前网页运行会话中。关闭网页、清除浏览器数据、云端应用重启或更换设备后不会自动同步。")
+    navigation = st.columns(2)
+    if navigation[0].button("会话组合", width="stretch"):
+        st.session_state.selected_session_key = None
+        st.session_state.pending_delete_session = None
+        st.rerun()
+    if navigation[1].button("＋ 分析另一只股票", type="primary", width="stretch"):
+        clear_stock_widgets()
+        st.rerun()
+
+    sessions = st.session_state.get("stock_sessions") or {}
+    selected_key = st.session_state.get("selected_session_key")
+    if not selected_key or selected_key not in sessions:
+        render_session_portfolio()
+        st.divider()
+        st.warning("该分析结果仅供参考，本模型仅用于学习与研究。")
+        return
+
+    session = sessions[selected_key]
+    st.subheader(f"{session.get('code', '—')} · {session.get('name', '—')}")
+    st.caption(f"{session.get('market', '—')}｜建立于 {str(session.get('created_at') or '—').replace('T', ' ')}")
+    latest = session.get("latest_summary") or {}
+    if latest:
+        summary_cols = st.columns(4)
+        summary_cols[0].metric("最近结论", latest.get("conclusion", "—"))
+        summary_cols[1].metric("个人适配", latest.get("suitability", "—"))
+        summary_cols[2].metric("股票风险", latest.get("stock_risk_level", "—"))
+        summary_cols[3].metric("复核／持有周期", latest.get("selected_horizon", "—"))
+
+    st.markdown("#### 实际投入本金")
+    st.caption("组合统计只读取这里保存的数值。计划买入金额不会自动当成已投入本金；实际成交后再更新。")
+    principal_key = f"session_principal_{selected_key}_{session.get('created_at', '')}"
+    principal_value = st.number_input(
+        "该股票累计实际投入本金（人民币元）",
+        min_value=0.0,
+        value=float(session.get("principal_rmb") or 0.0),
+        step=1000.0,
+        format="%.3f",
+        key=principal_key,
+        help="填0表示只保留查询记录、暂不计入持仓组合。",
+    )
+    principal_cols = st.columns([1, 2])
+    if principal_cols[0].button("保存投入本金", type="primary", width="stretch"):
+        try:
+            st.session_state.stock_sessions = set_invested_principal(sessions, selected_key, principal_value)
+            st.success("投入本金已保存，组合占比已按全部有效会话自动重算。")
+            st.rerun()
+        except (ValueError, KeyError) as exc:
+            st.error(str(exc))
+    principal_cols[1].caption(f"当前来源：{session.get('principal_source', '尚未记录')}。数值精确至小数点后三位。")
+
+    st.markdown("#### 会话记录")
+    for message in session.get("messages") or []:
+        role = message.get("role") if message.get("role") in {"user", "assistant"} else "assistant"
+        with st.chat_message(role):
+            st.markdown(str(message.get("content") or ""))
+            st.caption(str(message.get("created_at") or "").replace("T", " "))
+    note = st.chat_input("为这只股票添加一条个人备注", key=f"session_note_{selected_key}")
+    if note:
+        try:
+            st.session_state.stock_sessions = append_note(sessions, selected_key, note)
+            st.rerun()
+        except KeyError as exc:
+            st.error(str(exc))
+
+    st.divider()
+    action_cols = st.columns(2)
+    if action_cols[0].button("重新分析这只股票", width="stretch"):
+        market = str(session.get("market") or "A股")
+        code = str(session.get("code") or "")
+        clear_stock_widgets()
+        st.session_state.v5_market = market
+        st.session_state.v5_stock_code = code
+        st.rerun()
+    if action_cols[1].button("删除该股票会话", width="stretch"):
+        st.session_state.pending_delete_session = selected_key
+        st.rerun()
+
+    if st.session_state.get("pending_delete_session") == selected_key:
+        st.error("确认删除吗？删除后业务上视为该股票已全部卖出：其投入本金将立即从组合总额和持仓占比中剔除。")
+        delete_cols = st.columns(2)
+        if delete_cols[0].button("取消删除", width="stretch"):
+            st.session_state.pending_delete_session = None
+            st.rerun()
+        if delete_cols[1].button("确认删除并视为已卖出", type="primary", width="stretch"):
+            st.session_state.stock_sessions = delete_session(sessions, selected_key)
+            st.session_state.selected_session_key = None
+            st.session_state.pending_delete_session = None
+            st.rerun()
+
+    st.warning("该分析结果仅供参考，本模型仅用于学习与研究。")
 
 
 DISPLAY_DECIMALS = 3
@@ -634,7 +833,7 @@ def render_summary(bundle, analysis, profile) -> None:
         f"{analog.get('confidence_score', 0)}/100",
     )
     best_similarity = analog.get("best_similarity")
-    analog_cols[2].metric("最高相似度", f"{best_similarity:.3f}/100" if best_similarity is not None else "无有效样本")
+    analog_cols[2].metric("最高相似度", f"{best_similarity:.3f}/100" if best_similarity is not None else "暂无可比候选")
     selected_analog = None
     if selected:
         selected_analog = next(
@@ -646,14 +845,15 @@ def render_summary(bundle, analysis, profile) -> None:
             None,
         )
     if selected_analog:
+        selection_mode = selected_analog.get("selection_mode", "同股历史样本")
         st.info(
-            f"与当前状态相似的{selected_analog['sample_count']}个历史样本中，随后"
+            f"本期限采用{selection_mode}{selected_analog['sample_count']}个；随后"
             f"{selected_analog['days']}个交易日上涨样本占比为{selected_analog['positive_ratio']:.3%}，"
             f"收益中位数{selected_analog['median_return']:.3%}，"
             f"中间50%区间{selected_analog['q25_return']:.3%}至{selected_analog['q75_return']:.3%}。"
         )
     elif not analog.get("available"):
-        st.warning("有效相似样本不足，Agent没有生成方向预测；其他风险分析仍可继续查看。")
+        st.warning("本股在近五年窗口内没有形成达到最低要求的相似样本；请在相似周期页查看逐期限原因。")
     st.caption("这里展示的是历史样本频率和情景分布，不是确定上涨概率，也不是收益承诺。")
 
     left, right = st.columns(2)
@@ -943,11 +1143,7 @@ def render_horizons(analysis) -> None:
             {
                 "周期": item["name"],
                 "当前时点评分": f"{item['score']}/100" if item["score"] is not None else "—",
-                "相似周期修正": (
-                    f"{item.get('analog_adjustment', 0):+.1f}分"
-                    if item.get("analog_used")
-                    else "可信度不足" if item.get("analog_evidence") is not None else "无有效样本"
-                ),
+                "相似周期修正": item.get("analog_status") or "未进行相似周期修正",
                 "状态": item["label"],
                 "是否选中": "✓" if item["name"] == selected_name else "",
             }
@@ -972,6 +1168,9 @@ def analog_horizon_rows(forecast: dict) -> list[dict]:
             {
                 "观察期限": f"后续{item['days']}个交易日",
                 "有效样本": item.get("sample_count", 0),
+                "严格样本": item.get("strict_sample_count", 0),
+                "选样方式": item.get("selection_mode", "未形成样本"),
+                "相似度门槛": f"≥{float(item.get('selection_threshold', 0)):.3f}/100",
                 "历史上涨样本占比": pct(item.get("positive_ratio")) if item.get("available") else "样本不足",
                 "收益中位数": pct(item.get("median_return")) if item.get("available") else "—",
                 "中间50%区间": (
@@ -983,6 +1182,7 @@ def analog_horizon_rows(forecast: dict) -> list[dict]:
                 "期间最深浮亏中位数": pct(item.get("median_worst_loss")) if item.get("available") else "—",
                 "情景判断": item.get("direction", "—"),
                 "可信度": f"{item.get('confidence_score', 0)}/100" if item.get("available") else "—",
+                "样本说明": item.get("reason", "—"),
             }
         )
     return rows
@@ -1001,6 +1201,19 @@ def render_analog_forecast(analysis) -> None:
     state_cols[2].metric("回撤状态", state.get("drawdown", "数据不足"))
     state_cols[3].metric("市场状态", state.get("market", "数据不足"))
 
+    sample_cols = st.columns(4)
+    sample_cols[0].metric("可比较历史时点", f"{forecast.get('candidate_count', 0)}个")
+    sample_cols[1].metric("严格门槛候选", f"{forecast.get('eligible_candidate_count', 0)}个")
+    best_similarity = forecast.get("best_similarity")
+    sample_cols[2].metric(
+        "最高相似度",
+        f"{float(best_similarity):.3f}/100" if best_similarity is not None else "暂无候选",
+    )
+    sample_cols[3].metric(
+        "总体可信度",
+        f"{forecast.get('confidence_score', 0)}/100 · {forecast.get('confidence_label', '样本不足')}",
+    )
+
     current_features = forecast.get("current_features") or {}
     if current_features:
         feature_rows = []
@@ -1015,7 +1228,7 @@ def render_analog_forecast(analysis) -> None:
         st.markdown("#### 不同期限的历史后续表现")
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     if not forecast.get("available"):
-        st.warning("有效相似周期少于最低样本要求，Agent拒绝形成方向预测。")
+        st.warning("各期限没有同时达到最低样本数与可信度要求；具体门槛、样本数和原因已列在表格中。")
 
     available_horizons = [item for item in forecast.get("horizons", []) if item.get("available")]
     if available_horizons:
@@ -1082,6 +1295,7 @@ def render_analog_forecast(analysis) -> None:
     matches = forecast.get("matches") or []
     if matches:
         st.markdown("#### 最相似的历史窗口")
+        st.caption(f"窗口选样方式：{forecast.get('matches_selection_mode', '同股历史样本')}。")
         match_rows = []
         for item in matches:
             match_rows.append(
@@ -1117,7 +1331,7 @@ def render_analog_forecast(analysis) -> None:
         if market_rows:
             st.dataframe(pd.DataFrame(market_rows), hide_index=True, width="stretch")
         else:
-            st.info("市场基准没有足够的相似周期样本。")
+            st.info("市场基准未返回可比较数据；不会用其他股票冒充基准样本。")
 
     for note in forecast.get("notes", []):
         st.caption(f"• {note}")
@@ -1178,7 +1392,9 @@ def render_professional(bundle, analysis) -> None:
             - 用户风险等级与用户类型分开：经验丰富不自动等于风险承受能力高。
             - 股票风险分综合近一年波动、下行波动、全部历史回撤和Beta；最大回撤不会单独否决。
             - 当前时点分按不同周期分别计算，使用均线结构、动量、相对基准、成交量、基本面、市场环境和相似周期后续分布。
-            - 相似周期检索使用收益、波动、回撤、均线位置、成交量和市场基准特征；有效样本少于10个时拒绝形成预测。
+            - 相似周期检索使用收益、波动、回撤、均线位置、成交量和市场基准特征；先使用相似度不低于72分的严格同股样本。
+            - 严格样本不足10个时，系统自动尝试相似度不低于60分的同股样本，并下调可信度；仍不足10个时不形成该期限预测。
+            - 本股样本不可靠时，仅允许高可信度市场基准作不超过正负3分的小幅修正，并清楚标注来源；不会用其他个股冒充样本。
             - 相似周期最多只对当前时点评分进行有限修正，不会覆盖个人适配、安全限制或数据不足结论。
             - 20日滚动回测的每个验证时点只使用当时已经可见的数据，用于检查规则是否存在明显失效。
             - Agent在资金最早使用时间允许的范围内，结合投资目标、看盘条件和退出纪律选择周期。
@@ -1283,6 +1499,24 @@ def page_three() -> None:
                 st.rerun()
             st.stop()
 
+    try:
+        event_id = str(st.session_state.get("confirmed_analysis_id") or "")
+        if not event_id:
+            event_id = f"{confirmed_market}:{confirmed_code}:{st.session_state.analysis_request_token}"
+        updated_sessions, _ = upsert_analysis_session(
+            st.session_state.get("stock_sessions") or {},
+            event_id=event_id,
+            market=confirmed_market,
+            code=bundle.code,
+            name=bundle.name,
+            analysis=analysis,
+            holding_state=st.session_state.confirmed_holding_state,
+            holding_snapshot=holding_snapshot,
+        )
+        st.session_state.stock_sessions = updated_sessions
+    except Exception:
+        st.info("本次原有分析已经完成，但新增的股票会话记录暂未保存；分析结果本身不受影响。")
+
     full_first = bundle.stock["日期"].min().date()
     full_last = bundle.stock["日期"].max().date()
     st.success(f"{bundle.code}｜{bundle.name}｜{bundle.asset_type}｜分析区间 {full_first} 至 {full_last}，共 {len(bundle.stock)} 个交易日。")
@@ -1321,6 +1555,11 @@ def page_three() -> None:
 
     st.divider()
     st.warning("该分析结果仅供参考，本模型仅用于学习与研究。")
+    if st.button("打开本股票会话／登记实际投入本金", type="primary", width="stretch"):
+        st.session_state.selected_session_key = session_key(confirmed_market, bundle.code)
+        st.session_state.pending_delete_session = None
+        st.session_state.view = "sessions"
+        st.rerun()
     left, middle, right = st.columns(3)
     if left.button("换一只股票", width="stretch"):
         clear_stock_widgets()
@@ -1331,6 +1570,7 @@ def page_three() -> None:
     if right.button("刷新公开数据", width="stretch"):
         st.cache_data.clear()
         st.session_state.analysis_request_token += 1
+        st.session_state.confirmed_analysis_id = datetime.now().isoformat(timespec="microseconds")
         st.rerun()
 
 
@@ -1348,5 +1588,7 @@ elif st.session_state.view == "profile":
     personal_center()
 elif st.session_state.view == "result":
     page_three()
+elif st.session_state.view == "sessions":
+    stock_session_page()
 else:
     analysis_home()

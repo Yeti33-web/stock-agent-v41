@@ -28,8 +28,8 @@ except ImportError:
 
 
 HISTORY_YEARS = 5
-HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 StockResearchAgent/5.6"}
-SEC_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "IndividualInvestorResearchAgent/5.6 educational-use")}
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 StockResearchAgent/5.7"}
+SEC_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "IndividualInvestorResearchAgent/5.7 educational-use")}
 
 
 HORIZONS: list[dict[str, Any]] = [
@@ -99,7 +99,9 @@ ANALOG_HORIZONS: list[dict[str, Any]] = [
 
 ANALOG_MIN_SAMPLES = 10
 ANALOG_MIN_SIMILARITY = 72.0
+ANALOG_FALLBACK_MIN_SIMILARITY = 60.0
 ANALOG_SCORE_MIN_CONFIDENCE = 35
+ANALOG_MARKET_MIN_CONFIDENCE = 55
 ANALOG_FEATURE_WEIGHTS: dict[str, float] = {
     "return_5": 0.05,
     "return_20": 0.10,
@@ -1644,6 +1646,30 @@ def _walk_forward_analog_backtest(
     }
 
 
+def _unavailable_analog_horizon(config: dict[str, Any], reason: str) -> dict[str, Any]:
+    return {
+        **config,
+        "available": False,
+        "sample_count": 0,
+        "strict_sample_count": 0,
+        "adaptive_sample_count": 0,
+        "selection_mode": "未形成样本",
+        "selection_threshold": ANALOG_MIN_SIMILARITY,
+        "positive_ratio": None,
+        "median_return": None,
+        "q10_return": None,
+        "q25_return": None,
+        "q75_return": None,
+        "median_worst_loss": None,
+        "average_similarity": None,
+        "confidence_score": 0,
+        "direction": "样本不足，不形成预测",
+        "reason": reason,
+        "outcomes": [],
+        "paths": [],
+    }
+
+
 def analyze_historical_analogs(
     stock: pd.DataFrame,
     benchmark: pd.DataFrame | None,
@@ -1656,6 +1682,7 @@ def analyze_historical_analogs(
         "上涨占比是历史样本频率，不是经过校准的真实上涨概率。",
     ]
     if len(close) < 360 or features.empty:
+        reason = f"当前只有{len(close)}个交易日；至少需要约360个交易日才能建立状态特征与后续检验。"
         return {
             "available": False,
             "source_label": source_label,
@@ -1665,10 +1692,10 @@ def analyze_historical_analogs(
             "confidence_label": "样本不足",
             "state": {"summary": "历史数据不足，无法识别稳定状态"},
             "current_features": {},
-            "horizons": [],
+            "horizons": [_unavailable_analog_horizon(config, reason) for config in ANALOG_HORIZONS],
             "matches": [],
             "backtest": {"available": False, "cases": 0, "note": "至少需要约360个交易日。"},
-            "notes": notes + ["可得交易日不足，未形成相似周期预测。"],
+            "notes": notes + [reason],
         }
 
     state, current_display_features = _analog_state_summary(features)
@@ -1683,12 +1710,24 @@ def analyze_historical_analogs(
     eligible_similarities = similarities[similarities >= ANALOG_MIN_SIMILARITY]
 
     global_matches = _select_spaced_matches(
-        eligible_similarities,
+        similarities,
         date_positions,
         minimum_gap=20,
         limit=10,
         minimum_similarity=ANALOG_MIN_SIMILARITY,
     )
+    global_match_mode = "严格同股样本"
+    if len(global_matches) < 6:
+        adaptive_global_matches = _select_spaced_matches(
+            similarities,
+            date_positions,
+            minimum_gap=20,
+            limit=10,
+            minimum_similarity=ANALOG_FALLBACK_MIN_SIMILARITY,
+        )
+        if len(adaptive_global_matches) > len(global_matches):
+            global_matches = adaptive_global_matches
+            global_match_mode = "自适应同股样本"
     match_rows: list[dict[str, Any]] = []
     for timestamp, position, similarity in global_matches:
         row: dict[str, Any] = {
@@ -1704,13 +1743,28 @@ def analyze_historical_analogs(
     horizon_results: list[dict[str, Any]] = []
     for config in ANALOG_HORIZONS:
         days = int(config["days"])
-        selected = _select_spaced_matches(
-            eligible_similarities,
+        strict_selected = _select_spaced_matches(
+            similarities,
             date_positions,
             minimum_gap=int(config["minimum_gap"]),
             limit=20,
             minimum_similarity=ANALOG_MIN_SIMILARITY,
         )
+        selected = strict_selected
+        fallback_used = False
+        selection_threshold = ANALOG_MIN_SIMILARITY
+        if len(strict_selected) < ANALOG_MIN_SAMPLES:
+            adaptive_selected = _select_spaced_matches(
+                similarities,
+                date_positions,
+                minimum_gap=int(config["minimum_gap"]),
+                limit=20,
+                minimum_similarity=ANALOG_FALLBACK_MIN_SIMILARITY,
+            )
+            if len(adaptive_selected) > len(strict_selected):
+                selected = adaptive_selected
+                fallback_used = True
+                selection_threshold = ANALOG_FALLBACK_MIN_SIMILARITY
         outcomes: list[float] = []
         worst_losses: list[float] = []
         paths: list[dict[str, Any]] = []
@@ -1733,6 +1787,7 @@ def analyze_historical_analogs(
                 }
             )
         sample_count = len(outcomes)
+        strict_sample_count = len(strict_selected)
         available = sample_count >= ANALOG_MIN_SAMPLES
         if available:
             positive_ratio = float(np.mean(np.asarray(outcomes) > 0))
@@ -1744,22 +1799,46 @@ def analyze_historical_analogs(
             else:
                 direction = "历史情景分歧／中性"
             average_similarity = float(np.mean(similarities_used))
+            sample_component = min(sample_count / 15, 1.0) * 45
+            quality_component = float(
+                np.clip(
+                    (average_similarity - ANALOG_FALLBACK_MIN_SIMILARITY) / 25,
+                    0,
+                    1,
+                )
+                * 30
+            )
             horizon_confidence = int(
                 np.clip(
-                    min(sample_count / 15, 1.0) * 50
-                    + np.clip((average_similarity - ANALOG_MIN_SIMILARITY) / 20, 0, 1) * 35
-                    + (10 if history_complete else 0),
+                    sample_component
+                    + quality_component
+                    + (10 if history_complete else 0)
+                    + (10 if not fallback_used else -12),
                     0,
                     95,
                 )
             )
             if not history_complete:
                 horizon_confidence = max(0, horizon_confidence - 20)
+            if fallback_used:
+                reason = (
+                    f"严格样本{strict_sample_count}/{ANALOG_MIN_SAMPLES}个；"
+                    f"使用相似度不低于{ANALOG_FALLBACK_MIN_SIMILARITY:.0f}分的"
+                    f"自适应同股样本{sample_count}个，并下调可信度。"
+                )
+                selection_mode = "自适应同股样本"
+            else:
+                reason = f"严格同股样本{sample_count}个，达到最低样本要求。"
+                selection_mode = "严格同股样本"
             horizon_results.append(
                 {
                     **config,
                     "available": True,
                     "sample_count": sample_count,
+                    "strict_sample_count": strict_sample_count,
+                    "adaptive_sample_count": sample_count,
+                    "selection_mode": selection_mode,
+                    "selection_threshold": selection_threshold,
                     "positive_ratio": positive_ratio,
                     "median_return": median_return,
                     "q10_return": float(np.quantile(outcomes, 0.10)),
@@ -1769,16 +1848,28 @@ def analyze_historical_analogs(
                     "average_similarity": average_similarity,
                     "confidence_score": horizon_confidence,
                     "direction": direction,
+                    "reason": reason,
                     "outcomes": outcomes,
                     "paths": paths,
                 }
             )
         else:
+            best_similarity = float(similarities.max()) if not similarities.empty else None
+            reason = (
+                f"严格样本{strict_sample_count}/{ANALOG_MIN_SAMPLES}个；"
+                f"放宽至相似度{ANALOG_FALLBACK_MIN_SIMILARITY:.0f}分后仍只有"
+                f"{sample_count}/{ANALOG_MIN_SAMPLES}个"
+                + (f"；最高相似度{best_similarity:.3f}分。" if best_similarity is not None else "；没有可比较候选。")
+            )
             horizon_results.append(
                 {
                     **config,
                     "available": False,
                     "sample_count": sample_count,
+                    "strict_sample_count": strict_sample_count,
+                    "adaptive_sample_count": sample_count,
+                    "selection_mode": "样本不足",
+                    "selection_threshold": selection_threshold,
                     "positive_ratio": None,
                     "median_return": None,
                     "q10_return": None,
@@ -1788,6 +1879,7 @@ def analyze_historical_analogs(
                     "average_similarity": float(np.mean(similarities_used)) if similarities_used else None,
                     "confidence_score": 0,
                     "direction": "样本不足，不形成预测",
+                    "reason": reason,
                     "outcomes": [],
                     "paths": [],
                 }
@@ -1817,9 +1909,9 @@ def analyze_historical_analogs(
     if not history_complete:
         notes.append("该标的上市不足五年或数据覆盖不完整，已下调相似周期可信度。")
     if not available_horizons:
-        notes.append("有效相似样本少于最低要求，Agent拒绝形成方向预测。")
+        notes.append("各期限均未同时达到最低样本数与可信度要求；具体原因见逐期限表格，Agent不会强行形成方向预测。")
 
-    best_similarity = float(eligible_similarities.max()) if not eligible_similarities.empty else None
+    best_similarity = float(similarities.max()) if not similarities.empty else None
     return {
         "available": bool(available_horizons),
         "source_label": source_label,
@@ -1832,6 +1924,7 @@ def analyze_historical_analogs(
         "current_features": current_display_features,
         "horizons": horizon_results,
         "matches": match_rows,
+        "matches_selection_mode": global_match_mode,
         "backtest": backtest,
         "notes": notes,
     }
@@ -1911,21 +2004,71 @@ def _return_over(close: pd.Series, days: int) -> float:
     return float(close.iloc[-1] / close.iloc[-1 - days] - 1)
 
 
+def _analog_adjustment_value(
+    evidence: dict[str, Any],
+    days: int,
+    maximum_adjustment: float,
+) -> float:
+    positive_ratio = float(evidence["positive_ratio"])
+    median_return = float(evidence["median_return"])
+    expected_scale = 0.015 * np.sqrt(max(float(days), 5.0) / 5.0)
+    raw_adjustment = (positive_ratio - 0.50) * 20
+    raw_adjustment += float(np.clip(median_return / expected_scale, -1, 1) * 4)
+    q10_return = safe_float(evidence.get("q10_return"))
+    if q10_return is not None and q10_return < -0.15:
+        raw_adjustment -= 1.5
+    confidence_weight = 0.45 + 0.55 * float(evidence["confidence_score"]) / 100
+    return float(
+        np.clip(
+            raw_adjustment * confidence_weight,
+            -maximum_adjustment,
+            maximum_adjustment,
+        )
+    )
+
+
 def score_horizons(
     metrics: dict[str, Any],
     fundamental: EvidenceSnapshot,
     macro: EvidenceSnapshot,
     analog_forecast: dict[str, Any] | None = None,
+    market_analog_forecast: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     close: pd.Series = metrics["close"]
     benchmark_close: pd.Series = metrics["benchmark_close"]
     results: list[dict[str, Any]] = []
     for config in HORIZONS:
         if config["intraday_required"]:
-            results.append({**config, "available": False, "score": None, "label": "需要分钟级／实时数据", "reasons": ["当前免费接口只提供日线，不能可靠判断下一交易日涨跌。"]})
+            results.append(
+                {
+                    **config,
+                    "available": False,
+                    "score": None,
+                    "label": "需要分钟级／实时数据",
+                    "analog_adjustment": 0.0,
+                    "analog_evidence": None,
+                    "analog_used": False,
+                    "analog_source": "未使用",
+                    "analog_status": "缺少分钟／实时数据，不做次日相似修正",
+                    "reasons": ["当前免费接口只提供日线，不能可靠判断下一交易日涨跌。"],
+                }
+            )
             continue
         if len(close) < config["minimum_rows"]:
-            results.append({**config, "available": False, "score": None, "label": "历史数据不足", "reasons": [f"需要至少{config['minimum_rows']}个交易日，当前只有{len(close)}个。"]})
+            results.append(
+                {
+                    **config,
+                    "available": False,
+                    "score": None,
+                    "label": "历史数据不足",
+                    "analog_adjustment": 0.0,
+                    "analog_evidence": None,
+                    "analog_used": False,
+                    "analog_source": "未使用",
+                    "analog_status": f"行情仅{len(close)}日，最低需要{config['minimum_rows']}日",
+                    "reasons": [f"需要至少{config['minimum_rows']}个交易日，当前只有{len(close)}个。"],
+                }
+            )
             continue
         fast_ma = close.rolling(config["fast"]).mean().iloc[-1]
         slow_ma = close.rolling(config["slow"]).mean().iloc[-1]
@@ -1966,35 +2109,89 @@ def score_horizons(
             score += (fundamental.score - 50) * fundamental_weight
             reasons.append("基本面评分提供支持" if fundamental.score >= 55 else "基本面评分未形成明显支持")
         analog_adjustment = 0.0
-        analog_evidence = None
-        if analog_forecast:
-            analog_evidence = next(
-                (
-                    item
-                    for item in analog_forecast.get("horizons", [])
-                    if int(item.get("days", -1)) == int(config["days"]) and item.get("available")
-                ),
-                None,
-            )
+        stock_analog_result = next(
+            (
+                item
+                for item in (analog_forecast or {}).get("horizons", [])
+                if int(item.get("days", -1)) == int(config["days"])
+            ),
+            None,
+        )
+        market_analog_result = next(
+            (
+                item
+                for item in (market_analog_forecast or {}).get("horizons", [])
+                if int(item.get("days", -1)) == int(config["days"])
+            ),
+            None,
+        )
+        stock_analog_evidence = stock_analog_result if stock_analog_result and stock_analog_result.get("available") else None
+        market_analog_evidence = market_analog_result if market_analog_result and market_analog_result.get("available") else None
+        analog_evidence = stock_analog_evidence
         analog_used = False
-        if analog_evidence and int(analog_evidence.get("confidence_score", 0)) >= ANALOG_SCORE_MIN_CONFIDENCE:
+        analog_source = "未使用"
+        analog_status = ""
+        if stock_analog_evidence and int(stock_analog_evidence.get("confidence_score", 0)) >= ANALOG_SCORE_MIN_CONFIDENCE:
+            analog_evidence = stock_analog_evidence
             positive_ratio = float(analog_evidence["positive_ratio"])
             median_return = float(analog_evidence["median_return"])
-            expected_scale = 0.015 * np.sqrt(max(float(config["days"]), 5.0) / 5.0)
-            raw_adjustment = (positive_ratio - 0.50) * 20
-            raw_adjustment += float(np.clip(median_return / expected_scale, -1, 1) * 4)
-            if float(analog_evidence["q10_return"]) < -0.15:
-                raw_adjustment -= 1.5
-            confidence_weight = 0.45 + 0.55 * float(analog_evidence["confidence_score"]) / 100
-            analog_adjustment = float(np.clip(raw_adjustment * confidence_weight, -8, 8))
+            adaptive = analog_evidence.get("selection_mode") == "自适应同股样本"
+            analog_adjustment = _analog_adjustment_value(
+                analog_evidence,
+                int(config["days"]),
+                5.0 if adaptive else 8.0,
+            )
             score += analog_adjustment
             analog_used = True
+            analog_source = str(analog_evidence.get("selection_mode") or "严格同股样本")
+            analog_status = (
+                f"{analog_adjustment:+.1f}分（{analog_source}，"
+                f"{int(analog_evidence['sample_count'])}个，可信度{int(analog_evidence['confidence_score'])}/100）"
+            )
             reasons.append(
-                f"{analog_evidence['sample_count']}个相似周期后历史上涨占比{positive_ratio:.3%}，"
+                f"{analog_source}{analog_evidence['sample_count']}个：历史上涨占比{positive_ratio:.3%}，"
                 f"中位收益{median_return:.3%}"
             )
-        elif analog_evidence:
+        elif market_analog_evidence and int(market_analog_evidence.get("confidence_score", 0)) >= ANALOG_MARKET_MIN_CONFIDENCE:
+            analog_evidence = market_analog_evidence
+            analog_adjustment = _analog_adjustment_value(
+                market_analog_evidence,
+                int(config["days"]),
+                3.0,
+            )
+            score += analog_adjustment
+            analog_used = True
+            analog_source = f"市场基准：{(market_analog_forecast or {}).get('source_label', '公开基准')}"
+            stock_reason = str((stock_analog_result or {}).get("reason") or "个股同周期样本不足")
+            if stock_analog_evidence:
+                stock_gate_summary = (
+                    f"个股已有{int(stock_analog_evidence.get('sample_count', 0))}个"
+                    f"{stock_analog_evidence.get('selection_mode', '同股')}样本，"
+                    f"但可信度{int(stock_analog_evidence.get('confidence_score', 0))}/100"
+                    f"低于{ANALOG_SCORE_MIN_CONFIDENCE}/100"
+                )
+            else:
+                stock_gate_summary = "个股样本数未达到最低要求"
+            analog_status = (
+                f"{analog_adjustment:+.1f}分（{analog_source}，"
+                f"{int(market_analog_evidence['sample_count'])}个；{stock_gate_summary}）"
+            )
+            reasons.append(
+                f"{stock_gate_summary}；采用高可信度{analog_source}作不超过±3分的小幅修正。"
+                f"个股说明：{stock_reason}"
+            )
+        elif stock_analog_evidence:
+            analog_status = (
+                f"同股样本{int(stock_analog_evidence['sample_count'])}个，"
+                f"可信度{int(stock_analog_evidence.get('confidence_score', 0))}/100，未参与修正"
+            )
             reasons.append("相似周期历史回测可信度不足，已展示但未参与评分")
+        elif stock_analog_result:
+            analog_status = str(stock_analog_result.get("reason") or "同股有效样本不足")
+        elif int(config["days"]) >= 250:
+            analog_status = "近五年窗口不足以可靠检验250日后续表现，暂不修正"
+        else:
+            analog_status = "当前期限没有可用的相似周期模型"
         score_int = int(round(np.clip(score, 0, 100)))
         label = "条件较积极" if score_int >= 68 else "中性偏积极" if score_int >= 56 else "中性观察" if score_int >= 42 else "偏弱／暂缓"
         stress_returns = close.pct_change(config["days"]).dropna()
@@ -2012,7 +2209,11 @@ def score_horizons(
                 "historical_worst": historical_worst,
                 "analog_adjustment": analog_adjustment,
                 "analog_evidence": analog_evidence,
+                "stock_analog_result": stock_analog_result,
+                "market_analog_result": market_analog_result,
                 "analog_used": analog_used,
+                "analog_source": analog_source,
+                "analog_status": analog_status,
                 "reasons": reasons,
             }
         )
@@ -2539,7 +2740,13 @@ def analyze_all(
             "matches": [],
             "notes": ["市场基准未返回足够数据，无法单独检索市场相似周期。"],
         }
-    horizon_scores = score_horizons(metrics, fundamental, macro, analog_forecast)
+    horizon_scores = score_horizons(
+        metrics,
+        fundamental,
+        macro,
+        analog_forecast,
+        market_analog_forecast,
+    )
     selected_horizon, horizon_notes = choose_horizon(horizon_scores, profile)
     confidence, confidence_notes = calculate_data_confidence(metrics, fundamental, macro, bundle.asset_type)
     if not analog_forecast["available"]:
