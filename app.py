@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+from cloud_store import CloudConfig, CloudStore, CloudStoreError
 
 from agent_core import (
     EvidenceSnapshot,
@@ -34,16 +36,19 @@ from questionnaire import (
 )
 from session_memory import (
     append_note,
+    build_position_messages,
+    calculate_position_transaction,
     delete_session,
     portfolio_from_sessions,
     session_key,
     set_invested_principal,
     upsert_analysis_session,
 )
+from snapshot_codec import build_analysis_snapshot, restore_analysis_snapshot
 
 
 st.set_page_config(
-    page_title="个人投资者股票决策辅助 Agent V5.8",
+    page_title="个人投资者股票决策辅助 Agent V6.0",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -125,6 +130,9 @@ def cached_hkd_cny_rate() -> dict:
 
 def initialize_v5_state() -> None:
     defaults = {
+        "auth_user": None,
+        "auth_notice": "",
+        "cloud_store": None,
         "view": "analysis",
         "user_data_loaded": False,
         "profile_record": None,
@@ -149,6 +157,8 @@ def initialize_v5_state() -> None:
         "stock_sessions": {},
         "selected_session_key": None,
         "pending_delete_session": None,
+        "pending_delete_transaction": None,
+        "session_detail_mode": "完整分析",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -173,47 +183,151 @@ def initialize_v5_state() -> None:
                 st.session_state[key] = value
 
 
+def configured_cloud_store() -> CloudStore:
+    current = st.session_state.get("cloud_store")
+    if isinstance(current, CloudStore):
+        return current
+    try:
+        secrets = st.secrets
+        config = CloudConfig.from_mapping(secrets)
+    except Exception as exc:
+        if isinstance(exc, CloudStoreError):
+            raise
+        raise CloudStoreError("尚未读取到 Streamlit Secrets。") from exc
+    store = CloudStore(config)
+    st.session_state.cloud_store = store
+    return store
+
+
+def current_user_id() -> str:
+    user = st.session_state.get("auth_user") or {}
+    user_id = str(user.get("user_id") or "")
+    if not user_id:
+        raise CloudStoreError("登录状态已失效，请重新登录。")
+    return user_id
+
+
+def set_logged_in(identity: dict, store: CloudStore) -> None:
+    if not identity.get("user_id") or not identity.get("access_token"):
+        raise CloudStoreError("登录未返回有效会话，请确认邮箱后重新登录。")
+    st.session_state.auth_user = {
+        "user_id": str(identity["user_id"]),
+        "email": str(identity.get("email") or ""),
+    }
+    st.session_state.cloud_store = store
+    st.session_state.user_data_loaded = False
+    st.session_state.view = "analysis"
+    st.session_state.auth_notice = "登录成功。你的资料、会话和历史分析将永久保存到当前账号。"
+
+
+def auth_page() -> None:
+    render_brand("邮箱账号用于永久保存风险资料、股票会话、完整分析快照和加仓记录")
+    try:
+        store = configured_cloud_store()
+    except CloudStoreError as exc:
+        st.error("永久保存尚未完成最后一步配置。")
+        st.write(str(exc))
+        st.markdown(
+            "请先在 Streamlit Community Cloud 的 **App settings → Secrets** 中加入：\n\n"
+            "```toml\nSUPABASE_URL = \"你的 Project URL\"\n"
+            "SUPABASE_PUBLISHABLE_KEY = \"你的 Publishable key\"\n```"
+        )
+        st.caption("不要填写 secret key 或 service_role key，也不要把真实密钥上传到 GitHub。")
+        return
+
+    login_tab, register_tab = st.tabs(["邮箱登录", "首次注册"])
+    with login_tab:
+        with st.form("email_login_form"):
+            email = st.text_input("邮箱", key="login_email", placeholder="name@example.com")
+            password = st.text_input("密码", type="password", key="login_password")
+            submitted = st.form_submit_button("登录", type="primary", width="stretch")
+        if submitted:
+            if "@" not in email or len(password) < 8:
+                st.error("请输入有效邮箱；密码至少8位。")
+            else:
+                try:
+                    identity = store.sign_in(email.strip().lower(), password)
+                    set_logged_in(identity, store)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"登录失败：{exc}")
+    with register_tab:
+        st.caption("同一邮箱在手机、平板或另一台电脑登录后，可以恢复该账号保存的数据。")
+        with st.form("email_register_form"):
+            email = st.text_input("注册邮箱", key="register_email", placeholder="name@example.com")
+            password = st.text_input("设置密码（至少8位）", type="password", key="register_password")
+            password_again = st.text_input("再次输入密码", type="password", key="register_password_again")
+            submitted = st.form_submit_button("创建账号", type="primary", width="stretch")
+        if submitted:
+            if "@" not in email:
+                st.error("请输入有效邮箱。")
+            elif len(password) < 8:
+                st.error("密码至少8位。")
+            elif password != password_again:
+                st.error("两次输入的密码不一致。")
+            else:
+                try:
+                    identity = store.sign_up(email.strip().lower(), password)
+                    if identity.get("email_confirmation_required"):
+                        st.success("账号已创建。请先打开邮箱完成验证，再回到“邮箱登录”页登录。")
+                    else:
+                        set_logged_in(identity, store)
+                        st.rerun()
+                except Exception as exc:
+                    st.error(f"注册失败：{exc}")
+    st.warning("该分析结果仅供参考，本模型仅用于学习与研究。")
+
+
 def _session_load_profile() -> dict | None:
-    return st.session_state.get("dev_profile_record")
+    return configured_cloud_store().load_profile(current_user_id())
 
 
 def _session_load_draft() -> dict | None:
-    return st.session_state.get("dev_draft_record")
+    return configured_cloud_store().load_draft(current_user_id())
 
 
 def persist_draft(answers: dict, current_index: int) -> None:
-    st.session_state.dev_draft_record = {
-        "answers": dict(answers),
-        "current_index": int(current_index),
-        "updated_at": datetime.now().isoformat(),
-    }
+    record = configured_cloud_store().save_draft(current_user_id(), answers, current_index)
+    st.session_state.draft_record = record
 
 
 def remove_draft() -> None:
-    st.session_state.pop("dev_draft_record", None)
+    configured_cloud_store().delete_draft(current_user_id())
+    st.session_state.draft_record = None
 
 
 def persist_profile(profile: dict, risk_score: int, risk_level: str, version: int) -> dict:
+    now = datetime.now().isoformat()
     record = {
         "profile_data": dict(profile),
         "risk_score": int(risk_score),
         "risk_level": risk_level,
         "version": int(version) + 1,
-        "completed_at": datetime.now().isoformat(),
-        "updated_at": datetime.now().isoformat(),
+        "completed_at": now,
+        "updated_at": now,
     }
-    st.session_state.dev_profile_record = record
-    return record
+    return configured_cloud_store().save_profile(current_user_id(), record)
+
+
+def reload_cloud_sessions() -> None:
+    st.session_state.stock_sessions = configured_cloud_store().load_sessions(current_user_id())
 
 
 def load_current_user_data() -> None:
     if st.session_state.user_data_loaded:
         return
-    profile_record = _session_load_profile()
-    draft_record = _session_load_draft()
+    try:
+        profile_record = _session_load_profile()
+        draft_record = _session_load_draft()
+        sessions = configured_cloud_store().load_sessions(current_user_id())
+    except Exception as exc:
+        st.error("账号已登录，但云端资料读取失败。请确认已运行 V6.0 一键建表 SQL。")
+        st.code(str(exc))
+        st.stop()
     st.session_state.profile_record = profile_record
     st.session_state.saved_profile = profile_record.get("profile_data") if profile_record else None
     st.session_state.draft_record = draft_record
+    st.session_state.stock_sessions = sessions
     st.session_state.question_answers = dict((draft_record or {}).get("answers") or {})
     st.session_state.question_index = int((draft_record or {}).get("current_index") or first_unanswered_index(st.session_state.question_answers))
     if not profile_record:
@@ -224,7 +338,7 @@ def load_current_user_data() -> None:
 
 def render_brand(subtitle: str = "") -> None:
     st.markdown('<div class="app-brand">Five-year evidence · Personal suitability</div>', unsafe_allow_html=True)
-    st.title("个人投资者股票决策辅助 Agent｜股票会话记忆版 V5.8")
+    st.title("个人投资者股票决策辅助 Agent｜永久记忆版 V6.0")
     st.caption(subtitle or "近五年真实公开行情 · 历史相似状态检索 · 个人风险适配 · 教学研究原型")
 
 
@@ -236,7 +350,7 @@ def questionnaire_page() -> None:
     answers = dict(st.session_state.question_answers)
     index = int(st.session_state.question_index)
     total = len(QUESTIONS)
-    render_brand("本次网页会话首次测评提交后，日常换股不会再次要求填写")
+    render_brand("本账号首次测评提交后永久保存；日常换股不会再次要求填写")
     if index < total:
         question = QUESTIONS[index]
         st.progress((index + 1) / total, text=f"第 {index + 1} / {total} 题")
@@ -255,7 +369,11 @@ def questionnaire_page() -> None:
                 updated = dict(answers)
                 updated[str(question["key"])] = str(option)
                 next_index = index + 1
-                persist_draft(updated, next_index)
+                try:
+                    persist_draft(updated, next_index)
+                except Exception as exc:
+                    st.error(f"本题暂未保存，请检查网络后重试：{exc}")
+                    return
                 st.session_state.question_answers = updated
                 st.session_state.question_index = next_index
                 st.rerun()
@@ -297,7 +415,7 @@ def questionnaire_page() -> None:
             st.session_state.view = "analysis"
             st.session_state.confirm_profile_change = False
             st.rerun()
-        except ValueError as exc:
+        except Exception as exc:
             st.error(f"提交失败：{exc}")
 
 
@@ -313,13 +431,16 @@ def v5_market_changed() -> None:
 def analysis_home() -> None:
     profile = st.session_state.saved_profile
     record = st.session_state.profile_record or {}
-    render_brand("风险资料已在本次网页会话中生效；日常只需更换股票并填写本次投资信息")
+    render_brand("风险资料已永久保存到当前邮箱账号；日常只需更换股票并填写本次投资信息")
+    if st.session_state.get("auth_notice"):
+        st.info(str(st.session_state.auth_notice))
+        st.session_state.auth_notice = ""
     risk_cols = st.columns([1, 1, 1.4])
     risk_cols[0].metric("个人风险等级", record.get("risk_level", "—"), f"{record.get('risk_score', '—')}/100")
     risk_cols[1].metric("测评版本", f"第 {record.get('version', 1)} 版")
     risk_cols[2].metric("资产范围", profile.get("asset_band", "—"))
     st.markdown('<div class="hero-card"><b>选择本次要分析的股票</b><br><span class="muted">Agent统一使用最近五年行情，识别当前波动状态并检索历史相似周期；上市不足五年时使用全部可得数据并降低结论置信度。</span></div>', unsafe_allow_html=True)
-    st.caption("提示：本版不注册账号。关闭网页、清除浏览器数据或更换设备后，需要重新完成风险测评。")
+    st.caption("提示：在任何联网设备使用同一邮箱登录，即可恢复风险资料、股票会话、分析快照和买入记录。")
 
     stock_left, stock_right = st.columns([1, 1])
     with stock_left:
@@ -466,7 +587,7 @@ def personal_center() -> None:
     cols[2].metric("资料版本", f"第 {record.get('version', 1)} 版")
     updated = str(record.get("updated_at") or record.get("completed_at") or "")[:10]
     cols[3].metric("最近更新", updated or "—")
-    st.subheader("本次网页会话的风险资料")
+    st.subheader("当前邮箱账号的风险资料")
     st.dataframe(pd.DataFrame(public_profile_rows(profile), columns=["项目", "当前选择"]), hide_index=True, width="stretch")
 
     if st.session_state.draft_record:
@@ -479,9 +600,12 @@ def personal_center() -> None:
             st.session_state.view = "questionnaire"
             st.rerun()
         if discard_col.button("放弃草稿", width="stretch"):
-            remove_draft()
-            st.session_state.draft_record = None
-            st.rerun()
+            try:
+                remove_draft()
+                st.session_state.draft_record = None
+                st.rerun()
+            except Exception as exc:
+                st.error(f"草稿删除失败：{exc}")
 
     st.divider()
     if st.button("更改个人信息", type="primary"):
@@ -493,13 +617,16 @@ def personal_center() -> None:
             st.session_state.confirm_profile_change = False
             st.rerun()
         if confirm.button("确认重置并重新测评", type="primary", width="stretch"):
-            persist_draft({}, 0)
-            st.session_state.question_answers = {}
-            st.session_state.question_index = 0
-            st.session_state.questionnaire_mode = "update"
-            st.session_state.view = "questionnaire"
-            st.session_state.confirm_profile_change = False
-            st.rerun()
+            try:
+                persist_draft({}, 0)
+                st.session_state.question_answers = {}
+                st.session_state.question_index = 0
+                st.session_state.questionnaire_mode = "update"
+                st.session_state.view = "questionnaire"
+                st.session_state.confirm_profile_change = False
+                st.rerun()
+            except Exception as exc:
+                st.error(f"新测评草稿创建失败：{exc}")
 
 
 def clear_stock_widgets() -> None:
@@ -521,9 +648,20 @@ def clear_stock_widgets() -> None:
     st.session_state.view = "analysis"
 
 
+def logout_current_user() -> None:
+    try:
+        configured_cloud_store().sign_out()
+    except Exception:
+        pass
+    st.session_state.clear()
+    st.rerun()
+
+
 def app_sidebar() -> None:
     with st.sidebar:
         st.markdown("### 📊 股票决策辅助 Agent")
+        auth_user = st.session_state.get("auth_user") or {}
+        st.caption(f"已登录：{auth_user.get('email', '—')}")
         record = st.session_state.profile_record or {}
         st.caption(record.get("risk_level", "风险资料未完成"))
         if st.button("股票分析", width="stretch"):
@@ -552,8 +690,11 @@ def app_sidebar() -> None:
                 principal = float(session.get("principal_rmb") or 0.0)
                 label = f"{code} · {name}"
                 if st.button(label, key=f"sidebar_session_{index}", width="stretch"):
+                    st.session_state.pop(f"session_mode_{session.get('db_id') or key}", None)
+                    st.session_state.pop(f"snapshot_choice_{session.get('db_id') or ''}", None)
                     st.session_state.selected_session_key = key
                     st.session_state.pending_delete_session = None
+                    st.session_state.session_detail_mode = "完整分析"
                     st.session_state.view = "sessions"
                     st.rerun()
                 st.caption(f"已记录本金：{principal:,.3f} 元")
@@ -561,6 +702,8 @@ def app_sidebar() -> None:
             st.caption("完成一次股票分析后，会自动建立独立会话。")
         st.divider()
         st.caption("行情统一使用最近五年；相似样本不足时拒绝预测；新股标注低置信度。")
+        if st.button("退出当前邮箱账号", width="stretch"):
+            logout_current_user()
 
 
 def render_session_portfolio() -> None:
@@ -619,16 +762,365 @@ def render_session_portfolio() -> None:
         cols = st.columns([4, 1.2, 1.2])
         title = f"{session.get('code', '—')} · {session.get('name', '—')}（{session.get('market', '—')}）"
         if cols[0].button(title, key=f"portfolio_session_{index}", width="stretch"):
+            st.session_state.pop(f"session_mode_{session.get('db_id') or key}", None)
+            st.session_state.pop(f"snapshot_choice_{session.get('db_id') or ''}", None)
             st.session_state.selected_session_key = key
             st.session_state.pending_delete_session = None
+            st.session_state.session_detail_mode = "完整分析"
             st.rerun()
         cols[1].metric("投入本金", f"{float(session.get('principal_rmb') or 0.0):,.3f} 元")
         cols[2].metric("组合占比", f"{weights.get(key, 0.0):.3%}" if key in weights else "未计入")
 
 
+def render_saved_analysis(session: dict) -> None:
+    session_id = str(session.get("db_id") or "")
+    if not session_id:
+        st.info("该会话还没有云端编号，请重新分析一次后再查看完整历史结果。")
+        return
+    try:
+        store = configured_cloud_store()
+        snapshots = store.list_snapshots(current_user_id(), session_id)
+    except Exception as exc:
+        st.error(f"历史分析列表读取失败：{exc}")
+        return
+    if not snapshots:
+        st.info("该会话尚无完整分析快照。请点击下方“按最新持仓重新分析”，完成后会永久保存详细结果。")
+        return
+
+    labels: list[str] = []
+    for index, item in enumerate(snapshots):
+        created = str(item.get("created_at") or "").replace("T", " ")[:19]
+        conclusion = str((item.get("summary") or {}).get("conclusion") or "已完成分析")
+        prefix = "第一次分析" if index == 0 else f"第{index + 1}次分析"
+        labels.append(f"{prefix}｜{created or '时间未知'}｜{conclusion}")
+    chosen_label = st.selectbox(
+        "选择要恢复的分析版本",
+        labels,
+        index=0,
+        key=f"snapshot_choice_{session_id}",
+        help="默认显示第一次分析；重新分析只会新增版本，不会覆盖旧结果。",
+    )
+    selected = snapshots[labels.index(chosen_label)]
+    try:
+        row = store.load_snapshot(current_user_id(), str(selected.get("id") or ""))
+        if not row:
+            raise ValueError("未找到该分析快照。")
+        restored = restore_analysis_snapshot(row.get("snapshot_data") or {})
+    except Exception as exc:
+        st.error(f"完整分析恢复失败：{exc}")
+        return
+
+    bundle = restored["bundle"]
+    analysis = restored["analysis"]
+    profile = restored["profile"]
+    holding_state = restored["holding_state"]
+    first_date = bundle.stock["日期"].min().date()
+    last_date = bundle.stock["日期"].max().date()
+    st.success(
+        f"已恢复：{bundle.code}｜{bundle.name}｜分析区间 {first_date} 至 {last_date}｜"
+        f"共 {len(bundle.stock)} 个交易日。"
+    )
+    st.caption(f"当次行情来源：{bundle.provider}；这是已保存的历史快照，不会用今天的数据改写。")
+    if not bundle.history_complete:
+        st.warning("该次分析可得历史不足五年。数据不足，无法准确判断，结果仅作低置信度参考。")
+
+    previous_holding_state = st.session_state.get("confirmed_holding_state", "尚未持有")
+    previous_holding_method = st.session_state.get("confirmed_holding_method", "按持股数量填写")
+    st.session_state.confirmed_holding_state = holding_state
+    st.session_state.confirmed_holding_method = restored["holding_method"]
+    try:
+        view_mode = st.radio(
+            "结果显示",
+            ["简明模式", "专业模式"],
+            horizontal=True,
+            key=f"saved_view_mode_{selected.get('id')}",
+        )
+        tab_names = ["结论"]
+        if holding_state == "已经持有":
+            tab_names.append("卖出信号")
+        tab_names.extend(["相似周期预测", "风险与仓位", "持有周期", "数据证据"])
+        if view_mode == "专业模式":
+            tab_names.append("专业指标")
+        tabs = st.tabs(tab_names)
+        tab_map = dict(zip(tab_names, tabs))
+        with tab_map["结论"]:
+            render_summary(bundle, analysis, profile)
+        if "卖出信号" in tab_map:
+            with tab_map["卖出信号"]:
+                render_sell_signals(bundle, analysis, profile)
+        with tab_map["相似周期预测"]:
+            render_analog_forecast(analysis)
+        with tab_map["风险与仓位"]:
+            render_risk_budget(analysis, profile)
+        with tab_map["持有周期"]:
+            render_horizons(analysis)
+        with tab_map["数据证据"]:
+            render_evidence(bundle, analysis)
+        if view_mode == "专业模式":
+            with tab_map["专业指标"]:
+                render_professional(bundle, analysis)
+    finally:
+        st.session_state.confirmed_holding_state = previous_holding_state
+        st.session_state.confirmed_holding_method = previous_holding_method
+
+
+def render_position_entry(session: dict) -> None:
+    session_id = str(session.get("db_id") or "")
+    if not session_id:
+        st.error("该股票会话尚未同步到云端，暂时不能登记买入。")
+        return
+    principal = float(session.get("principal_rmb") or 0.0)
+    shares = session.get("total_shares")
+    shares_known = bool(session.get("shares_complete")) and shares is not None
+    metrics = st.columns(4)
+    metrics[0].metric("累计投入本金", f"{principal:,.3f} 元")
+    metrics[1].metric("已记录股数", f"{float(shares):,.3f} 股" if shares_known else "不完整／未知")
+    metrics[2].metric(
+        "人民币口径平均成本／股",
+        f"{principal / float(shares):,.3f} 元" if shares_known and float(shares) > 0 else "无法计算",
+    )
+    portfolio = portfolio_from_sessions(st.session_state.get("stock_sessions") or {})
+    weight = next((item["weight"] for item in portfolio["rows"] if item["key"] == session.get("key")), 0.0)
+    metrics[3].metric("会话组合占比", f"{weight:.3%}" if principal > 0 else "未计入")
+    st.info("此处仅记录你已经实际完成的买入，不会连接券商，也不会替你执行真实交易。")
+
+    method = st.radio(
+        "录入方式",
+        ["按实际支付人民币总额", "按股数和成交单价"],
+        horizontal=True,
+        key=f"position_method_{session_id}",
+        help="如果软件只显示股数和成交价，选择第二项，Agent会自动折算本次投入本金。",
+    )
+    trade_date = st.date_input("成交日期", value=date.today(), key=f"position_date_{session_id}")
+    amount_rmb = shares_bought = trade_price = fees_rmb = 0.0
+    fx_rate = 1.0
+    market = str(session.get("market") or "A股")
+    if method == "按实际支付人民币总额":
+        amount_rmb = st.number_input(
+            "本次实际支付总额（人民币元，包含交易费用）",
+            min_value=0.0,
+            step=1000.0,
+            format="%.3f",
+            key=f"position_amount_{session_id}",
+        )
+    else:
+        entry_cols = st.columns(3)
+        shares_bought = entry_cols[0].number_input(
+            "本次买入股数",
+            min_value=0.0,
+            step=100.0 if market == "A股" else 1.0,
+            format="%.3f",
+            key=f"position_shares_{session_id}",
+        )
+        native_unit = {"A股": "人民币元/股", "美股": "美元/股", "港股": "港元/股"}.get(market, "元/股")
+        trade_price = entry_cols[1].number_input(
+            f"成交单价（{native_unit}）",
+            min_value=0.0,
+            step=0.001,
+            format="%.3f",
+            key=f"position_price_{session_id}",
+        )
+        fees_rmb = entry_cols[2].number_input(
+            "本次交易费用（人民币元）",
+            min_value=0.0,
+            step=1.0,
+            format="%.3f",
+            key=f"position_fees_{session_id}",
+        )
+        if market in {"美股", "港股"}:
+            default_fx = 0.0
+            try:
+                snapshot = cached_usd_cny_rate() if market == "美股" else cached_hkd_cny_rate()
+                default_fx = float(snapshot.get("rate") or 0.0)
+                st.caption(f"已带入最近公开的{snapshot.get('provider', '参考')}汇率；请按你的实际换汇口径修改。")
+            except Exception:
+                st.caption("未能自动取得汇率，请填写成交时使用的外币兑人民币汇率。")
+            fx_rate = st.number_input(
+                "1单位外币折合人民币",
+                min_value=0.0,
+                value=default_fx,
+                step=0.001,
+                format="%.3f",
+                key=f"position_fx_{session_id}",
+            )
+    note = st.text_input("本次记录备注（可不填）", key=f"position_note_{session_id}")
+    preview = None
+    try:
+        preview = calculate_position_transaction(
+            market=market,
+            input_method=method,
+            amount_rmb=amount_rmb,
+            shares=shares_bought,
+            price_native=trade_price,
+            fx_rate=fx_rate,
+            fees_rmb=fees_rmb,
+        )
+    except ValueError:
+        preview = None
+    if preview:
+        st.success(f"本次将计入投入本金：{float(preview['principal_rmb']):,.3f} 元。保存后组合占比自动重算。")
+    else:
+        st.caption("填写完整后，这里会先显示本次计入的人民币本金。")
+
+    if st.button("永久保存本次首次买入／加仓", type="primary", width="stretch", key=f"save_position_{session_id}"):
+        try:
+            transaction = calculate_position_transaction(
+                market=market,
+                input_method=method,
+                amount_rmb=amount_rmb,
+                shares=shares_bought,
+                price_native=trade_price,
+                fx_rate=fx_rate,
+                fees_rmb=fees_rmb,
+            )
+            transaction_type = "initial" if principal <= 0 else "add"
+            transaction.update(
+                {
+                    "transaction_type": transaction_type,
+                    "trade_date": trade_date.isoformat(),
+                    "note": note.strip(),
+                }
+            )
+            store = configured_cloud_store()
+            user_id = current_user_id()
+            store.insert_transaction(user_id, session_id, transaction)
+            refreshed = store.get_session(user_id, session_id)
+            if not refreshed:
+                raise CloudStoreError("买入记录已提交，但未能重新读取股票会话。")
+            messages = list(refreshed.get("messages") or []) + build_position_messages(
+                transaction_type=transaction_type,
+                transaction=transaction,
+                trade_date=trade_date.isoformat(),
+                note=note,
+            )
+            store.update_stock_session(user_id, session_id, messages=messages)
+            reload_cloud_sessions()
+            st.success("已永久保存。累计投入本金和全部股票持仓占比已更新。")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"保存失败：{exc}")
+
+    st.markdown("#### 已保存的买入／加仓记录")
+    try:
+        transactions = configured_cloud_store().list_transactions(current_user_id(), session_id)
+    except Exception as exc:
+        st.error(f"买入记录读取失败：{exc}")
+        transactions = []
+    if not transactions:
+        st.caption("暂无记录。")
+    for index, item in enumerate(transactions):
+        action = "首次买入" if item.get("transaction_type") == "initial" else "加仓"
+        label = f"{item.get('trade_date', '—')}｜{action}｜{float(item.get('principal_rmb') or 0.0):,.3f} 元"
+        with st.expander(label):
+            if item.get("shares") is not None:
+                st.write(
+                    f"股数：{float(item['shares']):,.3f}；成交价：{float(item.get('price_native') or 0.0):,.3f} "
+                    f"{item.get('currency', '')}/股；汇率：{float(item.get('fx_rate') or 1.0):,.3f}；"
+                    f"费用：{float(item.get('fees_rmb') or 0.0):,.3f} 元。"
+                )
+            if item.get("note"):
+                st.caption(f"备注：{item['note']}")
+            transaction_id = str(item.get("id") or "")
+            if st.button("撤销这条误录记录", key=f"request_delete_tx_{index}_{transaction_id}"):
+                st.session_state.pending_delete_transaction = transaction_id
+                st.rerun()
+            if st.session_state.get("pending_delete_transaction") == transaction_id:
+                st.warning("仅在确属误录时撤销；撤销后，本金和持仓占比会自动回退。")
+                cancel, confirm = st.columns(2)
+                if cancel.button("取消", key=f"cancel_delete_tx_{transaction_id}", width="stretch"):
+                    st.session_state.pending_delete_transaction = None
+                    st.rerun()
+                if confirm.button("确认撤销", key=f"confirm_delete_tx_{transaction_id}", type="primary", width="stretch"):
+                    try:
+                        store = configured_cloud_store()
+                        user_id = current_user_id()
+                        store.delete_transaction(user_id, transaction_id)
+                        refreshed = store.get_session(user_id, session_id)
+                        if refreshed:
+                            messages = list(refreshed.get("messages") or []) + [
+                                {
+                                    "role": "assistant",
+                                    "content": f"已撤销{item.get('trade_date', '')}的误录记录，组合本金和占比已重新计算。",
+                                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                                    "kind": "position_undo",
+                                }
+                            ]
+                            store.update_stock_session(user_id, session_id, messages=messages)
+                        reload_cloud_sessions()
+                        st.session_state.pending_delete_transaction = None
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"撤销失败：{exc}")
+
+
+def render_session_messages(session: dict, selected_key: str) -> None:
+    session_id = str(session.get("db_id") or "")
+    with st.expander("校正累计实际投入本金"):
+        st.caption("一般应通过“首次买入／加仓”逐笔登记；仅在迁移旧持仓或发现汇总数有误时使用本项。")
+        principal_value = st.number_input(
+            "累计实际投入本金（人民币元）",
+            min_value=0.0,
+            value=float(session.get("principal_rmb") or 0.0),
+            step=1000.0,
+            format="%.3f",
+            key=f"session_principal_{session_id}",
+        )
+        if st.button("保存校正值", key=f"save_principal_{session_id}", type="primary"):
+            try:
+                updated = set_invested_principal(st.session_state.stock_sessions, selected_key, principal_value)
+                record = updated[selected_key]
+                configured_cloud_store().update_stock_session(
+                    current_user_id(),
+                    session_id,
+                    principal_rmb=float(record["principal_rmb"]),
+                    principal_source=str(record["principal_source"]),
+                )
+                reload_cloud_sessions()
+                st.rerun()
+            except Exception as exc:
+                st.error(f"保存失败：{exc}")
+
+    for message in session.get("messages") or []:
+        role = message.get("role") if message.get("role") in {"user", "assistant"} else "assistant"
+        with st.chat_message(role):
+            st.markdown(str(message.get("content") or ""))
+            st.caption(str(message.get("created_at") or "").replace("T", " "))
+    note = st.chat_input("为这只股票添加一条永久备注", key=f"session_note_{session_id}")
+    if note:
+        try:
+            updated = append_note(st.session_state.stock_sessions, selected_key, note)
+            messages = updated[selected_key].get("messages") or []
+            configured_cloud_store().update_stock_session(current_user_id(), session_id, messages=messages)
+            reload_cloud_sessions()
+            st.rerun()
+        except Exception as exc:
+            st.error(f"备注保存失败：{exc}")
+
+
+def open_reanalysis_form(session: dict) -> None:
+    market = str(session.get("market") or "A股")
+    code = str(session.get("code") or "")
+    principal = float(session.get("principal_rmb") or 0.0)
+    shares = session.get("total_shares")
+    shares_known = bool(session.get("shares_complete")) and shares is not None and float(shares) > 0
+    clear_stock_widgets()
+    st.session_state.v5_market = market
+    st.session_state.v5_stock_code = code
+    if principal > 0:
+        st.session_state.v5_holding_state = "已经持有"
+        if shares_known:
+            st.session_state.v5_holding_method = "按持股数量填写"
+            st.session_state.v5_share_count = float(shares)
+            st.session_state.v5_cost_price = 0.0
+        else:
+            st.session_state.v5_holding_method = "按持仓金额填写"
+            st.session_state.v5_current_value = 0.0
+            st.session_state.v5_total_cost = principal
+    st.session_state.auth_notice = "已带入股票和已知持仓。请核对当前持仓市值／成本后，再生成一个新的永久分析快照。"
+
+
 def stock_session_page() -> None:
-    render_brand("每只股票独立留存分析记录；删除会话在业务上等价于该股票已全部卖出")
-    st.info("会话记录只保存在当前网页运行会话中。关闭网页、清除浏览器数据、云端应用重启或更换设备后不会自动同步。")
+    render_brand("同一邮箱跨设备永久恢复；每只股票独立保存完整分析、买入记录与会话")
     navigation = st.columns(2)
     if navigation[0].button("会话组合", width="stretch"):
         st.session_state.selected_session_key = None
@@ -648,7 +1140,7 @@ def stock_session_page() -> None:
 
     session = sessions[selected_key]
     st.subheader(f"{session.get('code', '—')} · {session.get('name', '—')}")
-    st.caption(f"{session.get('market', '—')}｜建立于 {str(session.get('created_at') or '—').replace('T', ' ')}")
+    st.caption(f"{session.get('market', '—')}｜建立于 {str(session.get('created_at') or '—').replace('T', ' ')[:19]}")
     latest = session.get("latest_summary") or {}
     if latest:
         summary_cols = st.columns(4)
@@ -657,66 +1149,47 @@ def stock_session_page() -> None:
         summary_cols[2].metric("股票风险", latest.get("stock_risk_level", "—"))
         summary_cols[3].metric("复核／持有周期", latest.get("selected_horizon", "—"))
 
-    st.markdown("#### 实际投入本金")
-    st.caption("组合统计只读取这里保存的数值。计划买入金额不会自动当成已投入本金；实际成交后再更新。")
-    principal_key = f"session_principal_{selected_key}_{session.get('created_at', '')}"
-    principal_value = st.number_input(
-        "该股票累计实际投入本金（人民币元）",
-        min_value=0.0,
-        value=float(session.get("principal_rmb") or 0.0),
-        step=1000.0,
-        format="%.3f",
-        key=principal_key,
-        help="填0表示只保留查询记录、暂不计入持仓组合。",
+    modes = ["完整分析", "首次买入／加仓", "会话记录"]
+    preferred = st.session_state.get("session_detail_mode", "完整分析")
+    mode = st.radio(
+        "会话功能",
+        modes,
+        index=modes.index(preferred) if preferred in modes else 0,
+        horizontal=True,
+        key=f"session_mode_{session.get('db_id') or selected_key}",
     )
-    principal_cols = st.columns([1, 2])
-    if principal_cols[0].button("保存投入本金", type="primary", width="stretch"):
-        try:
-            st.session_state.stock_sessions = set_invested_principal(sessions, selected_key, principal_value)
-            st.success("投入本金已保存，组合占比已按全部有效会话自动重算。")
-            st.rerun()
-        except (ValueError, KeyError) as exc:
-            st.error(str(exc))
-    principal_cols[1].caption(f"当前来源：{session.get('principal_source', '尚未记录')}。数值精确至小数点后三位。")
-
-    st.markdown("#### 会话记录")
-    for message in session.get("messages") or []:
-        role = message.get("role") if message.get("role") in {"user", "assistant"} else "assistant"
-        with st.chat_message(role):
-            st.markdown(str(message.get("content") or ""))
-            st.caption(str(message.get("created_at") or "").replace("T", " "))
-    note = st.chat_input("为这只股票添加一条个人备注", key=f"session_note_{selected_key}")
-    if note:
-        try:
-            st.session_state.stock_sessions = append_note(sessions, selected_key, note)
-            st.rerun()
-        except KeyError as exc:
-            st.error(str(exc))
+    st.session_state.session_detail_mode = mode
+    if mode == "完整分析":
+        render_saved_analysis(session)
+    elif mode == "首次买入／加仓":
+        render_position_entry(session)
+    else:
+        render_session_messages(session, selected_key)
 
     st.divider()
     action_cols = st.columns(2)
-    if action_cols[0].button("重新分析这只股票", width="stretch"):
-        market = str(session.get("market") or "A股")
-        code = str(session.get("code") or "")
-        clear_stock_widgets()
-        st.session_state.v5_market = market
-        st.session_state.v5_stock_code = code
+    if action_cols[0].button("按最新持仓重新分析", width="stretch"):
+        open_reanalysis_form(session)
         st.rerun()
     if action_cols[1].button("删除该股票会话", width="stretch"):
         st.session_state.pending_delete_session = selected_key
         st.rerun()
 
     if st.session_state.get("pending_delete_session") == selected_key:
-        st.error("确认删除吗？删除后业务上视为该股票已全部卖出：其投入本金将立即从组合总额和持仓占比中剔除。")
+        st.error("确认删除吗？删除后业务上视为该股票已全部卖出；完整分析、买入记录、本金和组合占比都会永久剔除。")
         delete_cols = st.columns(2)
         if delete_cols[0].button("取消删除", width="stretch"):
             st.session_state.pending_delete_session = None
             st.rerun()
         if delete_cols[1].button("确认删除并视为已卖出", type="primary", width="stretch"):
-            st.session_state.stock_sessions = delete_session(sessions, selected_key)
-            st.session_state.selected_session_key = None
-            st.session_state.pending_delete_session = None
-            st.rerun()
+            try:
+                configured_cloud_store().delete_stock_session(current_user_id(), str(session.get("db_id") or ""))
+                st.session_state.stock_sessions = delete_session(sessions, selected_key)
+                st.session_state.selected_session_key = None
+                st.session_state.pending_delete_session = None
+                st.rerun()
+            except Exception as exc:
+                st.error(f"删除失败：{exc}")
 
     st.warning("该分析结果仅供参考，本模型仅用于学习与研究。")
 
@@ -1503,8 +1976,11 @@ def page_three() -> None:
         event_id = str(st.session_state.get("confirmed_analysis_id") or "")
         if not event_id:
             event_id = f"{confirmed_market}:{confirmed_code}:{st.session_state.analysis_request_token}"
+        sessions_before = st.session_state.get("stock_sessions") or {}
+        current_key = session_key(confirmed_market, bundle.code)
+        is_new_session = current_key not in sessions_before
         updated_sessions, _ = upsert_analysis_session(
-            st.session_state.get("stock_sessions") or {},
+            sessions_before,
             event_id=event_id,
             market=confirmed_market,
             code=bundle.code,
@@ -1513,9 +1989,34 @@ def page_three() -> None:
             holding_state=st.session_state.confirmed_holding_state,
             holding_snapshot=holding_snapshot,
         )
+        local_record = updated_sessions[current_key]
+        store = configured_cloud_store()
+        user_id = current_user_id()
+        cloud_record = store.upsert_stock_session(
+            user_id,
+            local_record,
+            include_position=is_new_session,
+        )
+        updated_sessions[current_key] = cloud_record
         st.session_state.stock_sessions = updated_sessions
-    except Exception:
-        st.info("本次原有分析已经完成，但新增的股票会话记录暂未保存；分析结果本身不受影响。")
+        snapshot_data = build_analysis_snapshot(
+            bundle=bundle,
+            analysis=analysis,
+            profile=profile,
+            holding_state=st.session_state.confirmed_holding_state,
+            holding_method=st.session_state.confirmed_holding_method,
+            holding_snapshot=holding_snapshot,
+        )
+        store.save_snapshot(
+            user_id,
+            str(cloud_record.get("db_id") or ""),
+            event_id,
+            cloud_record.get("latest_summary") or {},
+            snapshot_data,
+        )
+    except Exception as exc:
+        st.info("本次原有分析已经完成，但永久会话或完整快照暂未保存；分析计算本身不受影响。")
+        st.caption(f"保存失败原因：{exc}")
 
     full_first = bundle.stock["日期"].min().date()
     full_last = bundle.stock["日期"].max().date()
@@ -1556,8 +2057,15 @@ def page_three() -> None:
     st.divider()
     st.warning("该分析结果仅供参考，本模型仅用于学习与研究。")
     if st.button("打开本股票会话／登记实际投入本金", type="primary", width="stretch"):
+        current_session = (st.session_state.get("stock_sessions") or {}).get(session_key(confirmed_market, bundle.code), {})
+        st.session_state.pop(
+            f"session_mode_{current_session.get('db_id') or session_key(confirmed_market, bundle.code)}",
+            None,
+        )
+        st.session_state.pop(f"snapshot_choice_{current_session.get('db_id') or ''}", None)
         st.session_state.selected_session_key = session_key(confirmed_market, bundle.code)
         st.session_state.pending_delete_session = None
+        st.session_state.session_detail_mode = "完整分析"
         st.session_state.view = "sessions"
         st.rerun()
     left, middle, right = st.columns(3)
@@ -1575,6 +2083,9 @@ def page_three() -> None:
 
 
 initialize_v5_state()
+if not st.session_state.get("auth_user"):
+    auth_page()
+    st.stop()
 load_current_user_data()
 
 if st.session_state.saved_profile:

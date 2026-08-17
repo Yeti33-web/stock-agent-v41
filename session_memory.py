@@ -14,6 +14,95 @@ def now_text() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def market_currency(market: str) -> str:
+    return {"A股": "人民币元", "美股": "美元", "港股": "港元"}.get(str(market), "人民币元")
+
+
+def calculate_position_transaction(
+    *,
+    market: str,
+    input_method: str,
+    amount_rmb: float = 0.0,
+    shares: float = 0.0,
+    price_native: float = 0.0,
+    fx_rate: float = 1.0,
+    fees_rmb: float = 0.0,
+) -> dict[str, Any]:
+    """Validate one recorded purchase and return its RMB principal impact."""
+    cleaned_method = str(input_method).strip()
+    fees = float(fees_rmb)
+    if fees < 0:
+        raise ValueError("交易费用不能小于0。")
+    if cleaned_method == "按实际支付人民币总额":
+        principal = float(amount_rmb)
+        if principal <= 0:
+            raise ValueError("实际支付人民币总额必须大于0。")
+        return {
+            "input_method": "amount",
+            "principal_rmb": principal,
+            "shares": None,
+            "price_native": None,
+            "fx_rate": None,
+            "fees_rmb": 0.0,
+            "currency": market_currency(market),
+        }
+    if cleaned_method != "按股数和成交单价":
+        raise ValueError("请选择一种有效的买入记录方式。")
+    parsed_shares = float(shares)
+    parsed_price = float(price_native)
+    parsed_fx = 1.0 if market == "A股" else float(fx_rate)
+    if parsed_shares <= 0:
+        raise ValueError("买入股数必须大于0。")
+    if parsed_price <= 0:
+        raise ValueError("成交单价必须大于0。")
+    if parsed_fx <= 0:
+        raise ValueError("折算汇率必须大于0。")
+    principal = parsed_shares * parsed_price * parsed_fx + fees
+    return {
+        "input_method": "shares",
+        "principal_rmb": principal,
+        "shares": parsed_shares,
+        "price_native": parsed_price,
+        "fx_rate": parsed_fx,
+        "fees_rmb": fees,
+        "currency": market_currency(market),
+    }
+
+
+def build_position_messages(
+    *,
+    transaction_type: str,
+    transaction: Mapping[str, Any],
+    trade_date: str,
+    note: str = "",
+) -> list[dict[str, Any]]:
+    timestamp = now_text()
+    action = "首次买入" if transaction_type == "initial" else "加仓"
+    principal = float(transaction.get("principal_rmb") or 0.0)
+    if transaction.get("input_method") == "shares":
+        detail = (
+            f"{float(transaction.get('shares') or 0.0):,.3f}股 × "
+            f"{float(transaction.get('price_native') or 0.0):,.3f}{transaction.get('currency', '')}/股"
+        )
+        if float(transaction.get("fx_rate") or 1.0) != 1.0:
+            detail += f" × 汇率{float(transaction.get('fx_rate')):,.3f}"
+        if float(transaction.get("fees_rmb") or 0.0) > 0:
+            detail += f" + 费用{float(transaction.get('fees_rmb')):,.3f}元"
+    else:
+        detail = f"实际支付人民币{principal:,.3f}元"
+    user_content = f"记录{trade_date}{action}：{detail}。"
+    if str(note).strip():
+        user_content += f" 备注：{str(note).strip()}"
+    assistant_content = (
+        f"已记录{action}，本次计入投入本金{principal:,.3f}元；"
+        "组合本金和持仓占比已根据所有保留的有效股票会话重新计算。"
+    )
+    return [
+        {"role": "user", "content": user_content, "created_at": timestamp, "kind": "position_record"},
+        {"role": "assistant", "content": assistant_content, "created_at": timestamp, "kind": "position_confirmation"},
+    ]
+
+
 def known_invested_principal(holding_snapshot: Mapping[str, Any] | None) -> float:
     """Only a known historical cost is treated as invested principal."""
     if not holding_snapshot:
@@ -75,6 +164,13 @@ def upsert_analysis_session(
     record = updated.get(key)
     created = record is None
     if record is None:
+        known_shares = None
+        if holding_snapshot and holding_snapshot.get("method") == "按持股数量填写":
+            try:
+                parsed_shares = float(holding_snapshot.get("shares") or 0.0)
+                known_shares = parsed_shares if parsed_shares > 0 else None
+            except (TypeError, ValueError):
+                known_shares = None
         record = {
             "key": key,
             "market": market,
@@ -84,6 +180,8 @@ def upsert_analysis_session(
             "updated_at": timestamp,
             "principal_rmb": known_invested_principal(holding_snapshot),
             "principal_source": "已知持仓成本" if known_invested_principal(holding_snapshot) > 0 else "尚未记录实际投入",
+            "total_shares": known_shares,
+            "shares_complete": known_shares is not None,
             "messages": [],
             "recorded_event_ids": [],
         }
