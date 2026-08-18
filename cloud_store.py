@@ -96,6 +96,27 @@ class CloudStore:
     def sign_up(self, email: str, password: str) -> dict[str, Any]:
         return _auth_payload(self.client.auth.sign_up({"email": email, "password": password}))
 
+    def verify_signup_otp(self, email: str, token: str) -> dict[str, Any]:
+        """Verify the email code sent by Supabase and return the new session."""
+        return _auth_payload(
+            self.client.auth.verify_otp(
+                {
+                    "email": email,
+                    "token": token,
+                    "type": "email",
+                }
+            )
+        )
+
+    def resend_signup_otp(self, email: str) -> None:
+        """Resend the confirmation code for an existing unverified signup."""
+        self.client.auth.resend(
+            {
+                "type": "signup",
+                "email": email,
+            }
+        )
+
     def sign_in(self, email: str, password: str) -> dict[str, Any]:
         return _auth_payload(self.client.auth.sign_in_with_password({"email": email, "password": password}))
 

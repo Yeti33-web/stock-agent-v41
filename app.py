@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import time
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -48,7 +49,7 @@ from snapshot_codec import build_analysis_snapshot, restore_analysis_snapshot
 
 
 st.set_page_config(
-    page_title="个人投资者股票决策辅助 Agent V6.0",
+    page_title="个人投资者股票决策辅助 Agent V6.1",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -132,6 +133,10 @@ def initialize_v5_state() -> None:
     defaults = {
         "auth_user": None,
         "auth_notice": "",
+        "registration_otp_pending": False,
+        "registration_email": "",
+        "registration_otp_sent_at": 0.0,
+        "registration_notice": "",
         "cloud_store": None,
         "view": "analysis",
         "user_data_loaded": False,
@@ -220,6 +225,93 @@ def set_logged_in(identity: dict, store: CloudStore) -> None:
     st.session_state.auth_notice = "登录成功。你的资料、会话和历史分析将永久保存到当前账号。"
 
 
+def reset_registration_otp() -> None:
+    st.session_state.registration_otp_pending = False
+    st.session_state.registration_email = ""
+    st.session_state.registration_otp_sent_at = 0.0
+    st.session_state.registration_notice = ""
+
+
+def begin_registration_otp(email: str, notice: str) -> None:
+    # This function runs before the OTP widget is rendered, so clearing an older
+    # value here avoids mutating widget state after instantiation.
+    st.session_state.pop("register_otp", None)
+    st.session_state.registration_otp_pending = True
+    st.session_state.registration_email = email
+    st.session_state.registration_otp_sent_at = time.time()
+    st.session_state.registration_notice = notice
+
+
+def friendly_registration_error(exc: Exception) -> str:
+    raw = str(exc).strip()
+    lowered = raw.lower()
+    if "email rate limit exceeded" in lowered or "rate limit" in lowered:
+        return "验证码邮件发送次数已达到临时上限。请不要连续点击，稍后再试。"
+    if "expired" in lowered or "invalid" in lowered or "otp" in lowered and "verify" in lowered:
+        return "验证码错误或已经过期，请核对后重试；必要时重新发送验证码。"
+    if "already registered" in lowered or "already been registered" in lowered:
+        return "该邮箱可能已经注册。已完成验证请直接登录；尚未验证请使用下方“继续未完成注册”。"
+    return raw
+
+
+@st.fragment(run_every=1)
+def registration_otp_controls(store: CloudStore) -> None:
+    email = str(st.session_state.get("registration_email") or "")
+    sent_at = float(st.session_state.get("registration_otp_sent_at") or 0.0)
+    remaining = max(0, 60 - int(time.time() - sent_at)) if sent_at else 0
+    left, right = st.columns(2)
+    if left.button("修改邮箱", width="stretch", key="change_registration_email"):
+        reset_registration_otp()
+        st.rerun()
+    resend_label = f"重新发送验证码（{remaining}秒）" if remaining else "重新发送验证码"
+    if right.button(
+        resend_label,
+        width="stretch",
+        disabled=remaining > 0,
+        key="resend_registration_otp",
+    ):
+        try:
+            store.resend_signup_otp(email)
+            st.session_state.registration_otp_sent_at = time.time()
+            st.session_state.registration_notice = "新的验证码已经发送，请以最新一封邮件为准。"
+            st.rerun()
+        except Exception as exc:
+            st.error(f"重新发送失败：{friendly_registration_error(exc)}")
+
+
+def registration_otp_page(store: CloudStore) -> None:
+    email = str(st.session_state.get("registration_email") or "")
+    st.subheader("输入注册验证码")
+    notice = str(st.session_state.get("registration_notice") or "")
+    if notice:
+        st.success(notice)
+    st.write(f"验证码已发送至：**{email}**")
+    st.caption("请返回本页面输入邮件中的数字验证码，不需要点击邮件中的任何网址。")
+    with st.form("email_register_otp_form"):
+        token = st.text_input(
+            "邮箱验证码",
+            key="register_otp",
+            placeholder="请输入邮件中的验证码",
+            max_chars=8,
+        )
+        submitted = st.form_submit_button("验证并创建账号", type="primary", width="stretch")
+    if submitted:
+        normalized_token = "".join(token.split())
+        if not normalized_token.isdigit() or not 6 <= len(normalized_token) <= 8:
+            st.error("请输入邮件中的6位验证码；如果邮件显示8位，也可以直接输入。")
+        else:
+            try:
+                identity = store.verify_signup_otp(email, normalized_token)
+                reset_registration_otp()
+                set_logged_in(identity, store)
+                st.session_state.auth_notice = "注册验证成功。你的资料、会话和历史分析将永久保存到当前账号。"
+                st.rerun()
+            except Exception as exc:
+                st.error(f"验证失败：{friendly_registration_error(exc)}")
+    registration_otp_controls(store)
+    st.caption("验证码具有时效性且只能使用一次。请勿把验证码或登录密码告诉他人。")
+
+
 def auth_page() -> None:
     render_brand("邮箱账号用于永久保存风险资料、股票会话、完整分析快照和加仓记录")
     try:
@@ -233,6 +325,11 @@ def auth_page() -> None:
             "SUPABASE_PUBLISHABLE_KEY = \"你的 Publishable key\"\n```"
         )
         st.caption("不要填写 secret key 或 service_role key，也不要把真实密钥上传到 GitHub。")
+        return
+
+    if st.session_state.get("registration_otp_pending"):
+        registration_otp_page(store)
+        st.warning("该分析结果仅供参考，本模型仅用于学习与研究。")
         return
 
     login_tab, register_tab = st.tabs(["邮箱登录", "首次注册"])
@@ -257,7 +354,7 @@ def auth_page() -> None:
             email = st.text_input("注册邮箱", key="register_email", placeholder="name@example.com")
             password = st.text_input("设置密码（至少8位）", type="password", key="register_password")
             password_again = st.text_input("再次输入密码", type="password", key="register_password_again")
-            submitted = st.form_submit_button("创建账号", type="primary", width="stretch")
+            submitted = st.form_submit_button("发送注册验证码", type="primary", width="stretch")
         if submitted:
             if "@" not in email:
                 st.error("请输入有效邮箱。")
@@ -267,14 +364,45 @@ def auth_page() -> None:
                 st.error("两次输入的密码不一致。")
             else:
                 try:
-                    identity = store.sign_up(email.strip().lower(), password)
+                    normalized_email = email.strip().lower()
+                    identity = store.sign_up(normalized_email, password)
                     if identity.get("email_confirmation_required"):
-                        st.success("账号已创建。请先打开邮箱完成验证，再回到“邮箱登录”页登录。")
+                        begin_registration_otp(
+                            normalized_email,
+                            "注册验证码已经发送，请查看收件箱和垃圾邮件。",
+                        )
+                        st.rerun()
                     else:
                         set_logged_in(identity, store)
                         st.rerun()
                 except Exception as exc:
-                    st.error(f"注册失败：{exc}")
+                    st.error(f"发送失败：{friendly_registration_error(exc)}")
+
+        with st.expander("昨天已经创建账号，但没有完成邮箱验证？"):
+            with st.form("resume_unverified_signup_form"):
+                pending_email = st.text_input(
+                    "未验证的注册邮箱",
+                    key="pending_registration_email",
+                    placeholder="name@example.com",
+                )
+                resume_submitted = st.form_submit_button(
+                    "继续未完成注册并发送验证码",
+                    width="stretch",
+                )
+            if resume_submitted:
+                if "@" not in pending_email:
+                    st.error("请输入之前注册时使用的有效邮箱。")
+                else:
+                    normalized_email = pending_email.strip().lower()
+                    try:
+                        store.resend_signup_otp(normalized_email)
+                        begin_registration_otp(
+                            normalized_email,
+                            "新的注册验证码已经发送，请以最新一封邮件为准。",
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"发送失败：{friendly_registration_error(exc)}")
     st.warning("该分析结果仅供参考，本模型仅用于学习与研究。")
 
 
@@ -338,7 +466,7 @@ def load_current_user_data() -> None:
 
 def render_brand(subtitle: str = "") -> None:
     st.markdown('<div class="app-brand">Five-year evidence · Personal suitability</div>', unsafe_allow_html=True)
-    st.title("个人投资者股票决策辅助 Agent｜永久记忆版 V6.0")
+    st.title("个人投资者股票决策辅助 Agent｜永久记忆版 V6.1")
     st.caption(subtitle or "近五年真实公开行情 · 历史相似状态检索 · 个人风险适配 · 教学研究原型")
 
 
