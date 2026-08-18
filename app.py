@@ -9,6 +9,12 @@ import streamlit as st
 
 from cloud_store import CloudConfig, CloudStore, CloudStoreError
 
+from add_position_analysis import (
+    build_add_position_messages,
+    build_current_holding_snapshot,
+    evaluate_add_position,
+)
+
 from agent_core import (
     EvidenceSnapshot,
     analyze_all,
@@ -49,7 +55,7 @@ from snapshot_codec import build_analysis_snapshot, restore_analysis_snapshot
 
 
 st.set_page_config(
-    page_title="个人投资者股票决策辅助 Agent V6.1",
+    page_title="个人投资者股票决策辅助 Agent V6.2",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -466,7 +472,7 @@ def load_current_user_data() -> None:
 
 def render_brand(subtitle: str = "") -> None:
     st.markdown('<div class="app-brand">Five-year evidence · Personal suitability</div>', unsafe_allow_html=True)
-    st.title("个人投资者股票决策辅助 Agent｜永久记忆版 V6.1")
+    st.title("个人投资者股票决策辅助 Agent｜加仓适配分析版 V6.2")
     st.caption(subtitle or "近五年真实公开行情 · 历史相似状态检索 · 个人风险适配 · 教学研究原型")
 
 
@@ -1181,6 +1187,311 @@ def render_position_entry(session: dict) -> None:
                         st.error(f"撤销失败：{exc}")
 
 
+def saved_add_position_assessments(session: dict) -> list[dict]:
+    """Read persisted add-position assessments from this stock conversation."""
+    records: list[dict] = []
+    for message in session.get("messages") or []:
+        if message.get("kind") != "add_position_assessment":
+            continue
+        data = message.get("data")
+        if isinstance(data, dict):
+            records.append(data)
+    return records
+
+
+def render_add_position_assessment_result(assessment: dict) -> None:
+    conclusion = str(assessment.get("conclusion") or "证据不足")
+    reason = str(assessment.get("reason") or "没有足够证据形成结论。")
+    if conclusion == "可在风险预算内小额分批加仓":
+        st.success(f"### {conclusion}\n\n{reason}")
+    elif conclusion == "满足条件后再考虑加仓":
+        st.warning(f"### {conclusion}\n\n{reason}")
+    else:
+        st.error(f"### {conclusion}\n\n{reason}")
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("加仓条件分", f"{float(assessment.get('condition_score') or 0.0):.3f}/100")
+    metric_cols[1].metric(
+        "计划新增本金",
+        f"{float(assessment.get('planned_principal_rmb') or 0.0):,.3f} 元",
+    )
+    metric_cols[2].metric(
+        "当前剩余风险预算",
+        f"{float(assessment.get('remaining_upper_amount_rmb') or 0.0):,.3f} 元",
+    )
+    metric_cols[3].metric(
+        "加仓后占可投资资产",
+        f"{float(assessment.get('post_asset_pct') or 0.0):.3%}",
+    )
+
+    st.markdown("#### 加仓前后仓位测算")
+    remaining_after = max(
+        float(assessment.get("remaining_upper_amount_rmb") or 0.0)
+        - float(assessment.get("planned_principal_rmb") or 0.0),
+        0.0,
+    )
+    comparison = pd.DataFrame(
+        [
+            ["当前累计投入本金", f"{float(assessment.get('current_principal_rmb') or 0.0):,.3f} 元"],
+            ["当前市值／风险敞口", f"{float(assessment.get('current_market_value_rmb') or 0.0):,.3f} 元"],
+            ["加仓后累计投入本金", f"{float(assessment.get('post_principal_rmb') or 0.0):,.3f} 元"],
+            ["加仓后预计风险敞口", f"{float(assessment.get('post_market_exposure_rmb') or 0.0):,.3f} 元"],
+            ["模型单股风险预算上限", f"{float(assessment.get('model_upper_amount_rmb') or 0.0):,.3f} 元"],
+            ["执行本计划后预算余量", f"{remaining_after:,.3f} 元"],
+            ["当前会话组合占比", f"{float(assessment.get('current_portfolio_weight') or 0.0):.3%}"],
+            ["加仓后会话组合占比", f"{float(assessment.get('post_portfolio_weight') or 0.0):.3%}"],
+        ],
+        columns=["项目", "结果"],
+    )
+    st.dataframe(comparison, hide_index=True, width="stretch")
+    st.caption(str(assessment.get("current_value_source") or ""))
+
+    if assessment.get("post_shares") is not None:
+        share_cols = st.columns(2)
+        share_cols[0].metric("加仓后股数", f"{float(assessment['post_shares']):,.3f} 股")
+        share_cols[1].metric(
+            "加仓后人民币口径平均成本／股",
+            f"{float(assessment.get('post_average_cost_rmb') or 0.0):,.3f} 元",
+        )
+    elif assessment.get("input_method") == "amount":
+        st.caption("本次按人民币金额测算，未提供计划买入股数，因此不虚构加仓后股数和每股平均成本。")
+
+    sections = [
+        ("支持因素", assessment.get("support_factors") or []),
+        ("需要先满足的条件", assessment.get("trigger_conditions") or []),
+        ("当前限制", (assessment.get("hard_reasons") or []) + (assessment.get("conditional_reasons") or [])),
+        ("停止加仓／重新复核信号", assessment.get("stop_add_signals") or []),
+    ]
+    for title, items in sections:
+        st.markdown(f"#### {title}")
+        if items:
+            for item in items:
+                st.markdown(f"- {item}")
+        else:
+            st.caption("当前没有额外项目。")
+
+    st.caption(
+        f"行情日期：{assessment.get('latest_market_date') or '—'}；"
+        f"最新公开价格：{float(assessment.get('latest_price_native') or 0.0):,.3f} "
+        f"{assessment.get('price_unit') or ''}；来源：{assessment.get('provider') or '公开行情接口'}。"
+    )
+    if not bool(assessment.get("history_complete")):
+        st.warning("该股票可得历史不足五年。数据不足，无法准确判断，本次加仓结论仅作低置信度参考。")
+    st.info("本次仅保存加仓适配分析，没有改变真实持仓。只有实际成交后在“首次买入／加仓”中登记，才会更新本金、股数和组合占比。")
+
+
+def render_add_position_assessment(session: dict) -> None:
+    """Assess a hypothetical add while leaving all actual holding data unchanged."""
+    session_id = str(session.get("db_id") or "")
+    principal = float(session.get("principal_rmb") or 0.0)
+    if not session_id:
+        st.error("该股票会话尚未同步到云端，暂时不能保存加仓分析。")
+        return
+    if principal <= 0:
+        st.warning("该会话尚未登记实际持仓。请先在“首次买入／加仓”中保存已经发生的买入，再进行加仓适配分析。")
+        return
+
+    st.subheader("加仓适配分析")
+    st.caption("先测算、后决定；本页不会把计划金额记为真实成交，也不会改变现有仓位。")
+    portfolio = portfolio_from_sessions(st.session_state.get("stock_sessions") or {})
+    current_weight = next(
+        (float(item.get("weight") or 0.0) for item in portfolio["rows"] if item.get("key") == session.get("key")),
+        0.0,
+    )
+    shares = session.get("total_shares")
+    shares_known = bool(session.get("shares_complete")) and shares is not None and float(shares) > 0
+    current_cols = st.columns(3)
+    current_cols[0].metric("当前累计投入本金", f"{principal:,.3f} 元")
+    current_cols[1].metric("已记录股数", f"{float(shares):,.3f} 股" if shares_known else "不完整／未知")
+    current_cols[2].metric("当前会话组合占比", f"{current_weight:.3%}")
+
+    method = st.radio(
+        "计划加仓录入方式",
+        ["按计划投入人民币总额", "按计划股数和预计成交价"],
+        horizontal=True,
+        key=f"add_assessment_method_{session_id}",
+    )
+    amount_rmb = planned_shares = planned_price = fees_rmb = 0.0
+    planned_fx = 1.0
+    market = str(session.get("market") or "A股")
+    if method == "按计划投入人民币总额":
+        amount_rmb = st.number_input(
+            "计划新增金额（人民币元，包含预计费用）",
+            min_value=0.0,
+            step=1000.0,
+            format="%.3f",
+            key=f"add_assessment_amount_{session_id}",
+        )
+    else:
+        plan_cols = st.columns(3)
+        planned_shares = plan_cols[0].number_input(
+            "计划买入股数",
+            min_value=0.0,
+            step=100.0 if market == "A股" else 1.0,
+            format="%.3f",
+            key=f"add_assessment_shares_{session_id}",
+        )
+        native_unit = {"A股": "人民币元/股", "美股": "美元/股", "港股": "港元/股"}.get(market, "元/股")
+        planned_price = plan_cols[1].number_input(
+            f"预计成交价（{native_unit}）",
+            min_value=0.0,
+            step=0.001,
+            format="%.3f",
+            key=f"add_assessment_price_{session_id}",
+        )
+        fees_rmb = plan_cols[2].number_input(
+            "预计交易费用（人民币元）",
+            min_value=0.0,
+            step=1.0,
+            format="%.3f",
+            key=f"add_assessment_fees_{session_id}",
+        )
+        if market in {"美股", "港股"}:
+            default_fx = 0.0
+            try:
+                fx_snapshot = cached_usd_cny_rate() if market == "美股" else cached_hkd_cny_rate()
+                default_fx = float(fx_snapshot.get("rate") or 0.0)
+                st.caption(f"已带入{fx_snapshot.get('provider', '公开接口')}最近公开汇率，可按预计成交口径调整。")
+            except Exception:
+                st.caption("未能自动取得公开汇率，请填写预计成交时的外币兑人民币汇率。")
+            planned_fx = st.number_input(
+                "1单位外币预计折合人民币",
+                min_value=0.0,
+                value=default_fx,
+                step=0.001,
+                format="%.3f",
+                key=f"add_assessment_fx_{session_id}",
+            )
+
+    transaction = None
+    try:
+        transaction = calculate_position_transaction(
+            market=market,
+            input_method="按实际支付人民币总额" if method == "按计划投入人民币总额" else "按股数和成交单价",
+            amount_rmb=amount_rmb,
+            shares=planned_shares,
+            price_native=planned_price,
+            fx_rate=planned_fx,
+            fees_rmb=fees_rmb,
+        )
+    except ValueError:
+        transaction = None
+    if transaction:
+        st.success(f"本次计划加仓折合人民币本金：{float(transaction['principal_rmb']):,.3f} 元。")
+    else:
+        st.caption("填写完整后，这里会先显示本次计划新增的人民币本金。")
+
+    if st.button(
+        "获取最新公开数据并判断是否适合加仓",
+        type="primary",
+        width="stretch",
+        key=f"run_add_assessment_{session_id}",
+    ):
+        try:
+            if not transaction:
+                raise ValueError("请先完整填写计划加仓金额，或填写计划股数、预计成交价和必要汇率。")
+            saved_profile = dict(st.session_state.get("saved_profile") or {})
+            if not saved_profile:
+                raise ValueError("未读取到已生效的个人风险资料，请先到个人中心检查。")
+
+            with st.status("正在获取最新公开数据并复核加仓条件……", expanded=True) as status:
+                request_token = int(time.time() * 1000)
+                status.write("1/4 获取该股票近五年或上市以来全部可得行情")
+                bundle = cached_price_bundle(market, str(session.get("code") or ""), request_token)
+                if str(bundle.code).upper() != str(session.get("code") or "").upper():
+                    raise RuntimeError(
+                        f"股票代码校验失败：请求 {session.get('code')}，数据源返回 {bundle.code}。已停止分析。"
+                    )
+                last_price = float(bundle.stock["收盘"].iloc[-1])
+                current_fx = 1.0
+                if market in {"美股", "港股"} and shares_known:
+                    rate_snapshot = cached_usd_cny_rate() if market == "美股" else cached_hkd_cny_rate()
+                    current_fx = float(rate_snapshot.get("rate") or 0.0)
+                    if current_fx <= 0:
+                        raise RuntimeError("未取得有效的公开汇率，暂时不能准确折算现有持仓风险敞口。")
+                holding_snapshot = build_current_holding_snapshot(
+                    session=session,
+                    latest_price_native=last_price,
+                    fx_rate=current_fx,
+                    price_unit=bundle.price_unit,
+                )
+
+                status.write("2/4 获取公司基本面、估值和宏观市场信息")
+                profile = compose_analysis_profile(
+                    saved_profile,
+                    float(holding_snapshot["current_rmb"]) + float(transaction["principal_rmb"]),
+                    "否",
+                )
+                profile["current_holding_value"] = float(holding_snapshot["current_rmb"])
+                profile["additional_amount"] = float(transaction["principal_rmb"])
+                profile["holding_state"] = "已经持有"
+                fundamental = cached_fundamentals(market, bundle.code, round(last_price, 6), bundle.asset_type)
+                macro = cached_macro(market, bundle.benchmark)
+
+                status.write("3/4 复用原模型计算个人适配、时点、周期和风险预算")
+                analysis = analyze_all(bundle, profile, fundamental, macro)
+                assets = float(profile.get("investable_assets") or 0.0)
+                current_value = float(holding_snapshot["current_rmb"])
+                analysis["position"]["current_amount"] = current_value
+                analysis["position"]["current_pct"] = current_value / assets if assets > 0 else 0.0
+                analysis["position"]["remaining_upper_amount"] = max(
+                    float(analysis["position"]["upper_amount"]) - current_value,
+                    0.0,
+                )
+                analysis["position"]["remaining_upper_pct"] = (
+                    analysis["position"]["remaining_upper_amount"] / assets if assets > 0 else 0.0
+                )
+                sell_signals = analyze_sell_signals(bundle, analysis, profile, holding_snapshot)
+
+                status.write("4/4 综合现有仓位、组合集中度和卖出信号形成加仓结论")
+                assessment = evaluate_add_position(
+                    session=session,
+                    transaction=transaction,
+                    analysis=analysis,
+                    sell_signals=sell_signals,
+                    profile=profile,
+                    portfolio=portfolio,
+                    holding_snapshot=holding_snapshot,
+                    market_data={
+                        "latest_price_native": last_price,
+                        "price_unit": bundle.price_unit,
+                        "latest_market_date": pd.Timestamp(bundle.stock["日期"].iloc[-1]).date().isoformat(),
+                        "provider": bundle.provider,
+                        "history_complete": bool(bundle.history_complete),
+                        "assessed_at": datetime.now().isoformat(timespec="seconds"),
+                    },
+                )
+                status.update(label="加仓适配分析完成", state="complete", expanded=False)
+
+            store = configured_cloud_store()
+            user_id = current_user_id()
+            latest_session = store.get_session(user_id, session_id) or session
+            messages = list(latest_session.get("messages") or []) + build_add_position_messages(
+                transaction=transaction,
+                assessment=assessment,
+            )
+            store.update_stock_session(user_id, session_id, messages=messages)
+            reload_cloud_sessions()
+            st.success("本次加仓适配分析已永久保存；真实持仓没有发生任何变化。")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"加仓适配分析失败：{exc}")
+            st.caption("本次失败不会改变任何持仓数据。请检查股票代码、网络和计划加仓输入后重试。")
+
+    st.markdown("#### 已永久保存的加仓适配分析")
+    history = saved_add_position_assessments(session)
+    if not history:
+        st.caption("暂无记录。完成上方测算后，结果会保存在当前股票会话中。")
+    for reverse_index, assessment in enumerate(reversed(history)):
+        timestamp = str(assessment.get("assessed_at") or "—").replace("T", " ")
+        label = (
+            f"{timestamp}｜{assessment.get('conclusion', '证据不足')}｜"
+            f"计划 {float(assessment.get('planned_principal_rmb') or 0.0):,.3f} 元"
+        )
+        with st.expander(label, expanded=reverse_index == 0):
+            render_add_position_assessment_result(assessment)
+
+
 def render_session_messages(session: dict, selected_key: str) -> None:
     session_id = str(session.get("db_id") or "")
     with st.expander("校正累计实际投入本金"):
@@ -1277,7 +1588,10 @@ def stock_session_page() -> None:
         summary_cols[2].metric("股票风险", latest.get("stock_risk_level", "—"))
         summary_cols[3].metric("复核／持有周期", latest.get("selected_horizon", "—"))
 
-    modes = ["完整分析", "首次买入／加仓", "会话记录"]
+    modes = ["完整分析"]
+    if float(session.get("principal_rmb") or 0.0) > 0:
+        modes.append("加仓适配分析")
+    modes.extend(["首次买入／加仓", "会话记录"])
     preferred = st.session_state.get("session_detail_mode", "完整分析")
     mode = st.radio(
         "会话功能",
@@ -1289,6 +1603,8 @@ def stock_session_page() -> None:
     st.session_state.session_detail_mode = mode
     if mode == "完整分析":
         render_saved_analysis(session)
+    elif mode == "加仓适配分析":
+        render_add_position_assessment(session)
     elif mode == "首次买入／加仓":
         render_position_entry(session)
     else:
