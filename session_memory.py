@@ -127,13 +127,16 @@ def build_analysis_messages(
     timestamp = created_at or now_text()
     selected = analysis.get("selected_horizon") or {}
     suitability = analysis.get("suitability") or {}
+    news = analysis.get("news_analysis") or {}
     user_content = f"请分析{market} {code}（{name}），当前状态：{holding_state}。"
     assistant_content = (
         f"结论：{analysis.get('conclusion', '数据不足')}。"
         f"个人适配：{suitability.get('fit', '数据不足')}；"
         f"股票风险：{analysis.get('stock_risk_level', '数据不足')}；"
         f"建议复核／持有周期：{selected.get('name', '数据不足')}；"
-        f"数据完整度：{float(analysis.get('data_confidence') or 0.0):.3f}%。"
+        f"数据完整度：{float(analysis.get('data_confidence') or 0.0):.3f}%；"
+        f"最新资讯倾向：{news.get('direction', '未取得有效资讯')}；"
+        f"资讯修正：{int(news.get('score_adjustment') or 0):+d}分。"
     )
     return [
         {"role": "user", "content": user_content, "created_at": timestamp, "kind": "analysis_request"},

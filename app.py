@@ -52,10 +52,11 @@ from session_memory import (
     upsert_analysis_session,
 )
 from snapshot_codec import build_analysis_snapshot, restore_analysis_snapshot
+from news_analysis import assess_news, fetch_stock_news
 
 
 st.set_page_config(
-    page_title="个人投资者股票决策辅助 Agent V6.2",
+    page_title="个人投资者股票决策辅助 Agent V6.3",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -133,6 +134,12 @@ def cached_usd_cny_rate() -> dict:
 @st.cache_data(ttl=21600, show_spinner=False)
 def cached_hkd_cny_rate() -> dict:
     return fetch_hkd_cny_rate()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_stock_news(market: str, code: str, name: str, request_token: int) -> dict:
+    del request_token
+    return fetch_stock_news(market, code, name)
 
 
 def initialize_v5_state() -> None:
@@ -472,8 +479,8 @@ def load_current_user_data() -> None:
 
 def render_brand(subtitle: str = "") -> None:
     st.markdown('<div class="app-brand">Five-year evidence · Personal suitability</div>', unsafe_allow_html=True)
-    st.title("个人投资者股票决策辅助 Agent｜加仓适配分析版 V6.2")
-    st.caption(subtitle or "近五年真实公开行情 · 历史相似状态检索 · 个人风险适配 · 教学研究原型")
+    st.title("个人投资者股票决策辅助 Agent｜最新资讯融合版 V6.3")
+    st.caption(subtitle or "近五年真实公开行情 · 最新公开资讯 · 历史相似状态检索 · 个人风险适配 · 教学研究原型")
 
 
 def question_option_label(option: str, current: str | None) -> str:
@@ -972,7 +979,7 @@ def render_saved_analysis(session: dict) -> None:
         tab_names = ["结论"]
         if holding_state == "已经持有":
             tab_names.append("卖出信号")
-        tab_names.extend(["相似周期预测", "风险与仓位", "持有周期", "数据证据"])
+        tab_names.extend(["相似周期预测", "最新资讯", "风险与仓位", "持有周期", "数据证据"])
         if view_mode == "专业模式":
             tab_names.append("专业指标")
         tabs = st.tabs(tab_names)
@@ -984,6 +991,8 @@ def render_saved_analysis(session: dict) -> None:
                 render_sell_signals(bundle, analysis, profile)
         with tab_map["相似周期预测"]:
             render_analog_forecast(analysis)
+        with tab_map["最新资讯"]:
+            render_news_analysis(dict(analysis.get("news_analysis") or {}))
         with tab_map["风险与仓位"]:
             render_risk_budget(analysis, profile)
         with tab_map["持有周期"]:
@@ -1270,6 +1279,11 @@ def render_add_position_assessment_result(assessment: dict) -> None:
         else:
             st.caption("当前没有额外项目。")
 
+    news = assessment.get("news_analysis")
+    if isinstance(news, dict):
+        st.markdown("#### 本次加仓判断参考的最新资讯")
+        render_news_analysis(news)
+
     st.caption(
         f"行情日期：{assessment.get('latest_market_date') or '—'}；"
         f"最新公开价格：{float(assessment.get('latest_price_native') or 0.0):,.3f} "
@@ -1396,7 +1410,7 @@ def render_add_position_assessment(session: dict) -> None:
 
             with st.status("正在获取最新公开数据并复核加仓条件……", expanded=True) as status:
                 request_token = int(time.time() * 1000)
-                status.write("1/4 获取该股票近五年或上市以来全部可得行情")
+                status.write("1/5 获取该股票近五年或上市以来全部可得行情")
                 bundle = cached_price_bundle(market, str(session.get("code") or ""), request_token)
                 if str(bundle.code).upper() != str(session.get("code") or "").upper():
                     raise RuntimeError(
@@ -1416,7 +1430,7 @@ def render_add_position_assessment(session: dict) -> None:
                     price_unit=bundle.price_unit,
                 )
 
-                status.write("2/4 获取公司基本面、估值和宏观市场信息")
+                status.write("2/5 获取公司基本面、估值和宏观市场信息")
                 profile = compose_analysis_profile(
                     saved_profile,
                     float(holding_snapshot["current_rmb"]) + float(transaction["principal_rmb"]),
@@ -1426,10 +1440,18 @@ def render_add_position_assessment(session: dict) -> None:
                 profile["additional_amount"] = float(transaction["principal_rmb"])
                 profile["holding_state"] = "已经持有"
                 fundamental = cached_fundamentals(market, bundle.code, round(last_price, 6), bundle.asset_type)
+                company_name = fundamental.fields.get("公司名称") if fundamental.fields else None
+                if company_name:
+                    bundle.name = str(company_name)
                 macro = cached_macro(market, bundle.benchmark)
 
-                status.write("3/4 复用原模型计算个人适配、时点、周期和风险预算")
+                status.write("3/5 检索该股票最近公开资讯并核验来源")
+                news_payload = cached_stock_news(market, bundle.code, bundle.name, request_token)
+
+                status.write("4/5 复用原模型计算个人适配、时点、周期和风险预算")
                 analysis = analyze_all(bundle, profile, fundamental, macro)
+                selected_score = (analysis.get("selected_horizon") or {}).get("score")
+                analysis["news_analysis"] = assess_news(news_payload, selected_score)
                 assets = float(profile.get("investable_assets") or 0.0)
                 current_value = float(holding_snapshot["current_rmb"])
                 analysis["position"]["current_amount"] = current_value
@@ -1443,7 +1465,7 @@ def render_add_position_assessment(session: dict) -> None:
                 )
                 sell_signals = analyze_sell_signals(bundle, analysis, profile, holding_snapshot)
 
-                status.write("4/4 综合现有仓位、组合集中度和卖出信号形成加仓结论")
+                status.write("5/5 综合最新资讯、现有仓位、组合集中度和卖出信号形成加仓结论")
                 assessment = evaluate_add_position(
                     session=session,
                     transaction=transaction,
@@ -1730,6 +1752,98 @@ def render_price_charts(bundle, analysis) -> None:
     st.plotly_chart(drawdown_fig, width="stretch")
 
 
+def _news_time_text(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "时间未知"
+    try:
+        parsed = pd.Timestamp(text)
+        return parsed.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return text.replace("T", " ")[:16]
+
+
+def render_news_summary(news: dict) -> None:
+    st.markdown("#### 最新资讯辅助判断")
+    if not news:
+        st.info("该历史分析创建时尚未启用资讯模块；重新分析可获取当前最新公开资讯。")
+        return
+    metrics = st.columns(4)
+    metrics[0].metric("资讯综合倾向", str(news.get("direction") or "证据不足"))
+    adjustment = int(news.get("score_adjustment") or 0)
+    metrics[1].metric("资讯有限修正", f"{adjustment:+d} 分")
+    combined_score = news.get("combined_score")
+    metrics[2].metric(
+        "资讯结合后观察分",
+        f"{int(combined_score)}/100" if combined_score is not None else "无法计算",
+    )
+    metrics[3].metric(
+        "资讯可信度",
+        str(news.get("confidence_label") or "较低"),
+        f"{int(news.get('confidence_score') or 0)}/100",
+    )
+    st.write(str(news.get("summary") or "资讯证据不足，未参与本次判断。"))
+    st.caption(
+        "资讯只是原有量化时点评分的辅助修正，不改变个人风险等级、股票风险等级和硬性仓位限制；"
+        "分数不是上涨概率。"
+    )
+
+
+def render_news_analysis(news: dict) -> None:
+    st.subheader("本次分析参考的最新公开资讯")
+    if not news:
+        st.info("该历史分析创建时尚未启用资讯模块。请按最新数据重新分析后查看。")
+        return
+    fetched_at = _news_time_text(news.get("fetched_at"))
+    window_days = int(news.get("window_days") or 0)
+    st.caption(
+        f"检索时间：{fetched_at}；检索窗口：最近{window_days or '—'}天；"
+        f"有效资讯：{int(news.get('valid_count') or 0)}条；来源数：{int(news.get('source_count') or 0)}个。"
+    )
+    render_news_summary(news)
+
+    counts = dict(news.get("counts") or {})
+    count_cols = st.columns(3)
+    count_cols[0].metric("偏正面", f"{int(counts.get('positive') or 0)} 条")
+    count_cols[1].metric("偏负面", f"{int(counts.get('negative') or 0)} 条")
+    count_cols[2].metric("中性／不确定", f"{int(counts.get('neutral') or 0)} 条")
+
+    items = list(news.get("items") or [])
+    if not items:
+        st.warning("本次没有检索到足够的可核验公开资讯，因此没有编造资讯内容，也没有修改原有评分。")
+    for index, item in enumerate(items, start=1):
+        title = str(item.get("title") or "未命名资讯")
+        sentiment = str(item.get("sentiment") or "中性／不确定")
+        published = _news_time_text(item.get("published_at"))
+        with st.expander(f"{index}. {published}｜{sentiment}｜{title}"):
+            details = st.columns([1.2, 1, 1, 1])
+            details[0].write(f"**来源**\n\n{item.get('source') or item.get('provider') or '公开资讯'}")
+            details[1].write(f"**类别**\n\n{item.get('category') or '公司动态'}")
+            details[2].write(f"**关联度**\n\n{item.get('relevance') or '—'}")
+            details[3].write(f"**影响方向**\n\n{sentiment}")
+            summary = str(item.get("summary") or "").strip()
+            if summary:
+                st.write(f"**公开摘要：** {summary}")
+            else:
+                st.caption("该来源没有提供可展示的公开摘要，请通过原文链接核验。")
+            url = str(item.get("url") or "").strip()
+            if url.startswith(("http://", "https://")):
+                st.link_button("查看原始资讯", url)
+            matched = list(item.get("matched_terms") or [])
+            if matched:
+                st.caption("模型识别词：" + "、".join(str(value) for value in matched))
+
+    with st.expander("数据源、方法与失败说明"):
+        attempted = "、".join(str(item) for item in news.get("providers_attempted") or []) or "—"
+        used = "、".join(str(item) for item in news.get("providers_used") or []) or "本次无可用来源"
+        st.write(f"尝试的数据源：{attempted}")
+        st.write(f"实际采用的数据源：{used}")
+        st.write(str(news.get("method_note") or "资讯采用公开标题与摘要进行透明规则分析。"))
+        for warning in news.get("warnings") or []:
+            st.caption(f"• {warning}")
+    st.warning("新闻标题和摘要可能存在延迟、遗漏或表述偏差；重大事项应以交易所、监管机构和公司正式公告为准。")
+
+
 def render_summary(bundle, analysis, profile) -> None:
     selected = analysis["selected_horizon"]
     conclusion_box(analysis["conclusion"], analysis["conclusion_reason"])
@@ -1739,6 +1853,8 @@ def render_summary(bundle, analysis, profile) -> None:
     columns[2].metric("股票风险等级", analysis["stock_risk_level"], f"{analysis['stock_risk_score']}/100")
     columns[3].metric("个人适配", analysis["suitability"]["fit"])
     columns[4].metric("数据完整度", f"{float(analysis['data_confidence']):.3f}%")
+
+    render_news_summary(dict(analysis.get("news_analysis") or {}))
 
     analog = analysis.get("analog_forecast") or {}
     st.markdown("#### 历史相似状态情景")
@@ -2325,14 +2441,14 @@ def page_three() -> None:
     confirmed_market, confirmed_code = ensure_confirmed_stock()
     profile = dict(st.session_state.profile)
     render_brand(f"正在分析 {confirmed_market}｜{confirmed_code}")
-    st.subheader(f"Agent自动获取 {confirmed_code} 近五年数据、检索相似周期并分析")
+    st.subheader(f"Agent自动获取 {confirmed_code} 近五年数据、最新公开资讯并分析")
     with st.status("正在完成自动分析……", expanded=True) as status:
         try:
-            status.write("1/4 获取股票最近五年或上市以来全部可得行情")
+            status.write("1/5 获取股票最近五年或上市以来全部可得行情")
             bundle = cached_price_bundle(confirmed_market, confirmed_code, st.session_state.analysis_request_token)
             if str(bundle.code).upper() != confirmed_code.upper():
                 raise RuntimeError(f"股票代码校验失败：请求 {confirmed_code}，数据源返回 {bundle.code}。已停止分析，避免使用错误股票数据。")
-            status.write("2/4 获取基准、公司财务和估值信息")
+            status.write("2/5 获取基准、公司财务和估值信息")
             last_price = float(bundle.stock["收盘"].iloc[-1])
             holding_snapshot = None
             if st.session_state.confirmed_holding_state == "已经持有":
@@ -2374,10 +2490,19 @@ def page_three() -> None:
             company_name = fundamental.fields.get("公司名称") if fundamental.fields else None
             if company_name:
                 bundle.name = str(company_name)
-            status.write("3/4 识别市场与宏观环境")
+            status.write("3/5 检索该股票最近公开资讯并核验来源")
+            news_payload = cached_stock_news(
+                confirmed_market,
+                bundle.code,
+                bundle.name,
+                st.session_state.analysis_request_token,
+            )
+            status.write("4/5 识别市场与宏观环境")
             macro = cached_macro(confirmed_market, bundle.benchmark)
-            status.write("4/4 检索历史相似周期，计算多周期信号、个人适配和风险预算")
+            status.write("5/5 检索历史相似周期，综合资讯、个人适配和风险预算")
             analysis = analyze_all(bundle, profile, fundamental, macro)
+            selected_score = (analysis.get("selected_horizon") or {}).get("score")
+            analysis["news_analysis"] = assess_news(news_payload, selected_score)
             current_holding = float(profile.get("current_holding_value") or 0.0)
             assets = float(profile.get("investable_assets") or 0.0)
             analysis["position"]["current_amount"] = current_holding
@@ -2476,7 +2601,7 @@ def page_three() -> None:
     tab_names = ["结论"]
     if st.session_state.confirmed_holding_state == "已经持有":
         tab_names.append("卖出信号")
-    tab_names.extend(["相似周期预测", "风险与仓位", "持有周期", "数据证据"])
+    tab_names.extend(["相似周期预测", "最新资讯", "风险与仓位", "持有周期", "数据证据"])
     if view_mode == "专业模式":
         tab_names.append("专业指标")
     tabs = st.tabs(tab_names)
@@ -2488,6 +2613,8 @@ def page_three() -> None:
             render_sell_signals(bundle, analysis, profile)
     with tab_map["相似周期预测"]:
         render_analog_forecast(analysis)
+    with tab_map["最新资讯"]:
+        render_news_analysis(dict(analysis.get("news_analysis") or {}))
     with tab_map["风险与仓位"]:
         render_risk_budget(analysis, profile)
     with tab_map["持有周期"]:

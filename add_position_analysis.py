@@ -110,10 +110,13 @@ def evaluate_add_position(
 
     suitability = dict(analysis.get("suitability") or {})
     selected = dict(analysis.get("selected_horizon") or {})
+    news_analysis = dict(analysis.get("news_analysis") or {})
     position = dict(analysis.get("position") or {})
     fit = str(suitability.get("fit") or "证据不足")
-    timing_score = selected.get("score")
-    timing_score_value = _as_float(timing_score, 0.0) if timing_score is not None else None
+    base_timing_score = selected.get("score")
+    timing_score_value = _as_float(base_timing_score, 0.0) if base_timing_score is not None else None
+    if news_analysis.get("usable_for_score") and news_analysis.get("combined_score") is not None:
+        timing_score_value = _as_float(news_analysis.get("combined_score"), timing_score_value or 0.0)
     data_confidence = _as_float(analysis.get("data_confidence"), 0.0)
     upper_amount = max(_as_float(position.get("upper_amount")), 0.0)
     remaining_upper = max(upper_amount - current_value, 0.0)
@@ -147,6 +150,23 @@ def evaluate_add_position(
         trigger_conditions.append("等待所选周期评分达到56分以上，或支持因素明显增强后重新评估。")
     else:
         support_factors.append(f"当前所选周期评分为{timing_score_value:.0f}/100，未处于偏弱区间。")
+
+    news_adjustment = int(news_analysis.get("score_adjustment") or 0)
+    if news_analysis.get("usable_for_score"):
+        if news_adjustment <= -4:
+            conditional_reasons.append(
+                f"近期有效公开资讯整体偏负面，对原有时点评分作{news_adjustment:+d}分修正。"
+            )
+            trigger_conditions.append("等待重大负面事件得到澄清或被新的正式披露替代后重新分析。")
+            stop_add_signals.append("新的高相关负面公告或监管、业绩风险资讯出现。")
+        elif news_adjustment >= 4:
+            support_factors.append(
+                f"近期有效公开资讯整体偏正面，对原有时点评分作{news_adjustment:+d}分有限修正。"
+            )
+        else:
+            support_factors.append("近期公开资讯整体中性或影响有限，未明显改变原有量化判断。")
+    elif news_analysis.get("available"):
+        conditional_reasons.append("已检索到参考资讯，但有效样本或可信度不足，未用于修正加仓评分。")
 
     if data_confidence < 35:
         hard_reasons.append(f"数据完整度仅{data_confidence:.3f}%，不足以形成可靠的加仓判断。")
@@ -268,6 +288,8 @@ def evaluate_add_position(
         "model_upper_amount_rmb": upper_amount,
         "remaining_upper_amount_rmb": remaining_upper,
         "timing_score": timing_score_value,
+        "base_timing_score": _as_float(base_timing_score) if base_timing_score is not None else None,
+        "news_analysis": news_analysis,
         "selected_horizon": str(selected.get("name") or "数据不足"),
         "data_confidence": data_confidence,
         "suitability": fit,
@@ -301,6 +323,11 @@ def build_add_position_messages(
         )
     else:
         plan_text = f"计划新增人民币{principal:,.3f}元"
+    news = dict(assessment.get("news_analysis") or {})
+    news_text = (
+        f"最新资讯倾向：{news.get('direction', '未取得有效资讯')}，"
+        f"资讯修正{int(news.get('score_adjustment') or 0):+d}分；"
+    )
     user_message = {
         "role": "user",
         "content": f"请判断本股票现在是否适合加仓：{plan_text}。",
@@ -314,6 +341,7 @@ def build_add_position_messages(
             f"加仓条件分：{int(assessment.get('condition_score') or 0)}/100；"
             f"当前剩余风险预算参考上限：{_as_float(assessment.get('remaining_upper_amount_rmb')):,.3f}元；"
             f"加仓后风险敞口约占可投资金融资产{_as_float(assessment.get('post_asset_pct')):.3%}。"
+            f"{news_text}"
             "本次只保存分析，没有记为真实成交。"
         ),
         "created_at": timestamp,
@@ -321,4 +349,3 @@ def build_add_position_messages(
         "data": dict(assessment),
     }
     return [user_message, assistant_message]
-
