@@ -53,10 +53,11 @@ from session_memory import (
 )
 from snapshot_codec import build_analysis_snapshot, restore_analysis_snapshot
 from news_analysis import assess_news, fetch_stock_news
+from factor_analysis import build_factor_analysis
 
 
 st.set_page_config(
-    page_title="个人投资者股票决策辅助 Agent V6.3",
+    page_title="个人投资者股票决策辅助 Agent V6.4",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -479,7 +480,7 @@ def load_current_user_data() -> None:
 
 def render_brand(subtitle: str = "") -> None:
     st.markdown('<div class="app-brand">Five-year evidence · Personal suitability</div>', unsafe_allow_html=True)
-    st.title("个人投资者股票决策辅助 Agent｜最新资讯融合版 V6.3")
+    st.title("个人投资者股票决策辅助 Agent｜因子透明与历史验证版 V6.4")
     st.caption(subtitle or "近五年真实公开行情 · 最新公开资讯 · 历史相似状态检索 · 个人风险适配 · 教学研究原型")
 
 
@@ -979,7 +980,7 @@ def render_saved_analysis(session: dict) -> None:
         tab_names = ["结论"]
         if holding_state == "已经持有":
             tab_names.append("卖出信号")
-        tab_names.extend(["相似周期预测", "最新资讯", "风险与仓位", "持有周期", "数据证据"])
+        tab_names.extend(["相似周期预测", "最新资讯", "风险与仓位", "持有周期", "因子解释与验证", "数据证据"])
         if view_mode == "专业模式":
             tab_names.append("专业指标")
         tabs = st.tabs(tab_names)
@@ -997,6 +998,8 @@ def render_saved_analysis(session: dict) -> None:
             render_risk_budget(analysis, profile)
         with tab_map["持有周期"]:
             render_horizons(analysis)
+        with tab_map["因子解释与验证"]:
+            render_factor_analysis(bundle, analysis, profile)
         with tab_map["数据证据"]:
             render_evidence(bundle, analysis)
         if view_mode == "专业模式":
@@ -2401,6 +2404,161 @@ def render_evidence(bundle, analysis) -> None:
     st.info("宏观环境只作为修正因素。短期个股波动不能仅靠宏观数据预测，长期判断仍需结合公司基本面和估值。")
 
 
+def render_factor_analysis(bundle, analysis, profile) -> None:
+    """Show factor-level attribution and no-look-ahead historical checks.
+
+    Old V6.3 snapshots do not contain ``factor_analysis``. They are calculated
+    from the saved bundle at render time, so the original snapshot is not
+    overwritten and today's market data is never mixed into the old result.
+    """
+
+    factor_result = analysis.get("factor_analysis")
+    if not isinstance(factor_result, dict):
+        factor_result = build_factor_analysis(bundle, analysis, profile)
+
+    st.subheader("因子贡献解释与历史验证")
+    st.caption(
+        "贡献解释回答“本次分数由哪些规则推高或压低”；历史验证回答“这些可回溯因子在本股票过去是否有稳定方向”。"
+        "两者都不是上涨概率，也不会自动改写个人适配、安全限制或仓位上限。"
+    )
+
+    timing_rows = list(factor_result.get("timing_contributions") or [])
+    total_row = next((item for item in timing_rows if item.get("因子") == "量化评分合计"), None)
+    news_row = next((item for item in timing_rows if item.get("模块") == "资讯辅助修正"), None)
+    chart_rows = [
+        item
+        for item in timing_rows
+        if item.get("因子") not in {"基础分", "量化评分合计"}
+    ]
+    if total_row:
+        cols = st.columns(3)
+        cols[0].metric("所选周期原量化分", f"{float(total_row.get('本次贡献') or 0.0):.3f}/100")
+        cols[1].metric(
+            "最新资讯辅助修正",
+            f"{float((news_row or {}).get('本次贡献') or 0.0):+.3f}分",
+            help="资讯只形成辅助观察值，不覆盖原量化分。",
+        )
+        selected = analysis.get("selected_horizon") or {}
+        cols[2].metric("当前选择的持有期", str(selected.get("name") or "数据不足"))
+
+    if chart_rows:
+        chart_frame = pd.DataFrame(chart_rows)
+        chart_frame["本次贡献"] = pd.to_numeric(chart_frame["本次贡献"], errors="coerce").fillna(0.0)
+        colors = ["#16a34a" if value >= 0 else "#dc2626" for value in chart_frame["本次贡献"]]
+        figure = go.Figure(
+            go.Bar(
+                x=chart_frame["本次贡献"],
+                y=chart_frame["因子"],
+                orientation="h",
+                marker_color=colors,
+                text=[f"{value:+.3f}" for value in chart_frame["本次贡献"]],
+                textposition="outside",
+                customdata=chart_frame[["当前值", "说明"]].astype(str).to_numpy(),
+                hovertemplate=(
+                    "%{y}<br>贡献：%{x:+.3f}分<br>当前值：%{customdata[0]}"
+                    "<br>%{customdata[1]}<extra></extra>"
+                ),
+            )
+        )
+        figure.update_layout(
+            title="本次时点分的逐项贡献（不含固定基础分50）",
+            height=max(380, 48 * len(chart_frame)),
+            margin=dict(l=20, r=70, t=55, b=20),
+            xaxis_title="贡献分",
+            yaxis=dict(autorange="reversed"),
+        )
+        st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
+
+        display_timing = chart_frame[["模块", "因子", "当前值", "本次贡献", "分值范围", "说明"]].copy()
+        display_timing["本次贡献"] = display_timing["本次贡献"].map(lambda value: f"{float(value):+.3f}分")
+        display_timing["当前值"] = display_timing.apply(
+            lambda row: (
+                f"{float(row['当前值']):.3%}"
+                if isinstance(row["当前值"], (int, float))
+                and ("相对MA" in str(row["因子"]) or "动量" in str(row["因子"]) or row["因子"] == "相对基准收益")
+                else (f"{float(row['当前值']):.3f}" if isinstance(row["当前值"], (int, float)) else str(row["当前值"]))
+            ),
+            axis=1,
+        )
+        st.dataframe(display_timing, hide_index=True, width="stretch")
+    else:
+        st.info("当前没有可解释的持有期时点评分。")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### 用户风险分贡献")
+        investor = pd.DataFrame(factor_result.get("investor_contributions") or [])
+        if not investor.empty:
+            investor["本次贡献"] = investor["本次贡献"].map(lambda value: f"{float(value):.3f}分")
+            st.dataframe(investor[["因子", "当前值", "本次贡献", "分值范围"]], hide_index=True, width="stretch")
+        else:
+            st.info("用户风险资料不完整。")
+    with right:
+        st.markdown("#### 股票风险分贡献")
+        stock_risk = pd.DataFrame(factor_result.get("stock_risk_contributions") or [])
+        if not stock_risk.empty:
+            def _risk_value(row) -> str:
+                value = row["当前值"]
+                if value is None or pd.isna(value):
+                    return "数据不足"
+                if row["因子"] in {"近一年年化波动率", "最大回撤", "下行波动率"}:
+                    return f"{float(value):.3%}"
+                return f"{float(value):.3f}"
+
+            stock_risk["当前值"] = stock_risk.apply(_risk_value, axis=1)
+            stock_risk["本次贡献"] = stock_risk["本次贡献"].map(lambda value: f"{float(value):.3f}分")
+            st.dataframe(stock_risk[["因子", "当前值", "本次贡献", "分值范围", "说明"]], hide_index=True, width="stretch")
+        else:
+            st.info("股票风险数据不完整。")
+
+    validation = dict(factor_result.get("historical_validation") or {})
+    st.markdown("#### 历史滚动验证与权重建议")
+    st.write(validation.get("method") or "当前没有可执行的历史验证。")
+    st.info(validation.get("summary") or "历史验证数据不足，暂不依据小样本调整生产权重。")
+    validation_rows = pd.DataFrame(validation.get("rows") or [])
+    if not validation_rows.empty:
+        validation_display = validation_rows[
+            ["因子", "当前权重", "有效验证时点", "秩相关IC", "方向命中率", "高低组收益差", "前半段IC", "后半段IC", "建议", "依据"]
+        ].copy()
+        for column in ["秩相关IC", "前半段IC", "后半段IC"]:
+            validation_display[column] = validation_display[column].map(
+                lambda value: "—" if value is None or pd.isna(value) else f"{float(value):.3f}"
+            )
+        for column in ["方向命中率", "高低组收益差"]:
+            validation_display[column] = validation_display[column].map(
+                lambda value: "—" if value is None or pd.isna(value) else f"{float(value):.3%}"
+            )
+        st.dataframe(validation_display, hide_index=True, width="stretch")
+
+        recommendation_groups = {label: [] for label in ("保留", "降低权重", "候选删除")}
+        for item in validation.get("rows") or []:
+            recommendation_groups.setdefault(str(item.get("建议")), []).append(str(item.get("因子")))
+        columns = st.columns(3)
+        for column, label in zip(columns, ("保留", "降低权重", "候选删除")):
+            factors = recommendation_groups.get(label) or []
+            column.metric(label, f"{len(factors)}项")
+            column.caption("、".join(factors) if factors else "本次无")
+
+    st.warning(
+        "本页建议只针对这只股票、当前所选持有期的历史样本。V6.4不会自动删除或修改生产因子权重；"
+        "只有在A股、美股、港股多标的样本外验证中仍稳定成立，才应进入下一版权重调整。"
+    )
+    for limitation in validation.get("limitations") or []:
+        st.caption(f"• {limitation}")
+    st.caption(str(factor_result.get("policy_note") or ""))
+
+    with st.expander("查看全部因子字典：公式、数据要求、方向、权重与缺失处理"):
+        catalog = pd.DataFrame(factor_result.get("catalog") or [])
+        if catalog.empty:
+            st.info("因子字典暂不可用。")
+        else:
+            modules = ["全部"] + sorted(catalog["模块"].dropna().astype(str).unique().tolist())
+            selected_module = st.selectbox("筛选模块", modules, key=f"factor_module_{bundle.code}")
+            if selected_module != "全部":
+                catalog = catalog[catalog["模块"] == selected_module]
+            st.dataframe(catalog, hide_index=True, width="stretch")
+
+
 def render_professional(bundle, analysis) -> None:
     metrics = analysis["metrics"]
     st.subheader("专业指标与模型边界")
@@ -2503,6 +2661,7 @@ def page_three() -> None:
             analysis = analyze_all(bundle, profile, fundamental, macro)
             selected_score = (analysis.get("selected_horizon") or {}).get("score")
             analysis["news_analysis"] = assess_news(news_payload, selected_score)
+            analysis["factor_analysis"] = build_factor_analysis(bundle, analysis, profile)
             current_holding = float(profile.get("current_holding_value") or 0.0)
             assets = float(profile.get("investable_assets") or 0.0)
             analysis["position"]["current_amount"] = current_holding
@@ -2601,7 +2760,7 @@ def page_three() -> None:
     tab_names = ["结论"]
     if st.session_state.confirmed_holding_state == "已经持有":
         tab_names.append("卖出信号")
-    tab_names.extend(["相似周期预测", "最新资讯", "风险与仓位", "持有周期", "数据证据"])
+    tab_names.extend(["相似周期预测", "最新资讯", "风险与仓位", "持有周期", "因子解释与验证", "数据证据"])
     if view_mode == "专业模式":
         tab_names.append("专业指标")
     tabs = st.tabs(tab_names)
@@ -2619,6 +2778,8 @@ def page_three() -> None:
         render_risk_budget(analysis, profile)
     with tab_map["持有周期"]:
         render_horizons(analysis)
+    with tab_map["因子解释与验证"]:
+        render_factor_analysis(bundle, analysis, profile)
     with tab_map["数据证据"]:
         render_evidence(bundle, analysis)
     if view_mode == "专业模式":
