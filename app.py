@@ -57,7 +57,7 @@ from factor_analysis import build_factor_analysis
 
 
 st.set_page_config(
-    page_title="个人投资者股票决策辅助 Agent V6.4",
+    page_title="个人投资者股票决策辅助 Agent V6.6",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -480,7 +480,7 @@ def load_current_user_data() -> None:
 
 def render_brand(subtitle: str = "") -> None:
     st.markdown('<div class="app-brand">Five-year evidence · Personal suitability</div>', unsafe_allow_html=True)
-    st.title("个人投资者股票决策辅助 Agent｜因子透明与历史验证版 V6.4")
+    st.title("个人投资者股票决策辅助 Agent｜融合校准版 V6.6")
     st.caption(subtitle or "近五年真实公开行情 · 最新公开资讯 · 历史相似状态检索 · 个人风险适配 · 教学研究原型")
 
 
@@ -1451,7 +1451,7 @@ def render_add_position_assessment(session: dict) -> None:
                 status.write("3/5 检索该股票最近公开资讯并核验来源")
                 news_payload = cached_stock_news(market, bundle.code, bundle.name, request_token)
 
-                status.write("4/5 复用原模型计算个人适配、时点、周期和风险预算")
+                status.write("4/5 使用V6.6融合校准模型计算方向可信度、个人适配、周期和风险预算")
                 analysis = analyze_all(bundle, profile, fundamental, macro)
                 selected_score = (analysis.get("selected_horizon") or {}).get("score")
                 analysis["news_analysis"] = assess_news(news_payload, selected_score)
@@ -1850,12 +1850,15 @@ def render_news_analysis(news: dict) -> None:
 def render_summary(bundle, analysis, profile) -> None:
     selected = analysis["selected_horizon"]
     conclusion_box(analysis["conclusion"], analysis["conclusion_reason"])
-    columns = st.columns(5)
+    columns = st.columns(6)
     columns[0].metric("用户风险等级", analysis["investor_level"], f"{analysis['investor_score']}/100")
-    columns[1].metric("用户类型", analysis["style"])
-    columns[2].metric("股票风险等级", analysis["stock_risk_level"], f"{analysis['stock_risk_score']}/100")
-    columns[3].metric("个人适配", analysis["suitability"]["fit"])
-    columns[4].metric("数据完整度", f"{float(analysis['data_confidence']):.3f}%")
+    columns[1].metric("股票风险等级", analysis["stock_risk_level"], f"{analysis['stock_risk_score']}/100")
+    columns[2].metric("行情方向信号", analysis.get("market_signal") or (selected or {}).get("label", "证据不足"))
+    signal_confidence = analysis.get("signal_confidence")
+    columns[3].metric("方向可信度", f"{int(signal_confidence)}/100" if signal_confidence is not None else "旧版未提供")
+    columns[4].metric("个人适配", analysis["suitability"]["fit"])
+    columns[5].metric("数据完整度", f"{float(analysis['data_confidence']):.3f}%")
+    st.caption(f"用户类型：{analysis.get('style', '—')}。行情方向与个人适配是两件不同的事：适配不等于未来会上涨。")
 
     render_news_summary(dict(analysis.get("news_analysis") or {}))
 
@@ -1890,7 +1893,7 @@ def render_summary(bundle, analysis, profile) -> None:
         )
     elif not analog.get("available"):
         st.warning("本股在近五年窗口内没有形成达到最低要求的相似样本；请在相似周期页查看逐期限原因。")
-    st.caption("这里展示的是历史样本频率和情景分布，不是确定上涨概率，也不是收益承诺。")
+    st.caption("这里展示的是历史样本频率和情景分布，不是确定上涨概率，也不是收益承诺；V6.6相似周期不参与评分。")
 
     left, right = st.columns(2)
     with left:
@@ -1898,6 +1901,24 @@ def render_summary(bundle, analysis, profile) -> None:
         if selected:
             st.markdown(f"**{selected['name']}** · {selected['review']}")
             st.write(f"当前时点评分：**{selected['score']}/100（{selected['label']}）**。该分数不是上涨概率。")
+            validation = dict(selected.get("signal_validation") or {})
+            st.write(
+                f"历史验证：**{validation.get('status', '旧版未提供')}** · "
+                f"方向可信度 **{int(selected.get('signal_confidence') or 0)}/100**。"
+            )
+            certification = dict(validation.get("cross_security_certification") or {})
+            if certification and not certification.get("certified"):
+                st.warning(
+                    "当前周期尚未通过跨股票样本外认证，因此这里只展示观察分，"
+                    "不把它解释为未来涨跌或买入方向。"
+                )
+            if validation.get("local_direction_hit_rate") is not None:
+                st.caption(
+                    f"当前相近分数历史样本{int(validation.get('local_band_count') or 0)}个；"
+                    f"与当前方向一致的占比{float(validation['local_direction_hit_rate']):.3%}，"
+                    f"符号调整后中位收益"
+                    f"{float(validation.get('local_signed_median_return') or 0.0):.3%}。"
+                )
             for note in analysis["horizon_notes"]:
                 st.caption(f"• {note}")
         else:
@@ -2179,7 +2200,10 @@ def render_horizons(analysis) -> None:
             {
                 "周期": item["name"],
                 "当前时点评分": f"{item['score']}/100" if item["score"] is not None else "—",
-                "相似周期修正": item.get("analog_status") or "未进行相似周期修正",
+                "历史验证": (item.get("signal_validation") or {}).get("status", "—"),
+                "方向可信度": f"{int(item.get('signal_confidence') or 0)}/100",
+                "是否形成方向": "是" if item.get("direction_available") else "否",
+                "相似周期": item.get("analog_status") or "仅展示，不计分",
                 "状态": item["label"],
                 "是否选中": "✓" if item["name"] == selected_name else "",
             }
@@ -2190,8 +2214,8 @@ def render_horizons(analysis) -> None:
     if available:
         colors = ["#2563eb" if item["name"] == selected_name else "#94a3b8" for item in available]
         fig = go.Figure(go.Bar(x=[item["name"] for item in available], y=[item["score"] for item in available], marker_color=colors))
-        fig.add_hline(y=42, line_dash="dot", annotation_text="偏弱/观察分界")
-        fig.add_hline(y=56, line_dash="dot", annotation_text="中性偏积极分界")
+        fig.add_hline(y=45, line_dash="dot", annotation_text="偏弱/观察分界")
+        fig.add_hline(y=60, line_dash="dot", annotation_text="中性偏积极分界")
         fig.update_layout(height=360, yaxis_range=[0, 100], yaxis_title="当前时点评分", margin=dict(l=20, r=20, t=20, b=20))
         st.plotly_chart(fig, width="stretch")
     st.warning("1个交易日需要分钟级或实时行情、交易成本与盘口信息。本版只有公开日线，因此会显示该周期但不会假装给出可靠次日预测。")
@@ -2540,8 +2564,8 @@ def render_factor_analysis(bundle, analysis, profile) -> None:
             column.caption("、".join(factors) if factors else "本次无")
 
     st.warning(
-        "本页建议只针对这只股票、当前所选持有期的历史样本。V6.4不会自动删除或修改生产因子权重；"
-        "只有在A股、美股、港股多标的样本外验证中仍稳定成立，才应进入下一版权重调整。"
+        "本页单项建议只针对这只股票、当前所选持有期。V6.6不会根据一次结果重新拟合权重；"
+        "但会用预先固定的历史验证闸门将技术贡献保留、减半或归零。跨市场样本外验证仍是后续正式调参依据。"
     )
     for limitation in validation.get("limitations") or []:
         st.caption(f"• {limitation}")
@@ -2582,13 +2606,15 @@ def render_professional(bundle, analysis) -> None:
             """
             - 用户风险等级与用户类型分开：经验丰富不自动等于风险承受能力高。
             - 股票风险分综合近一年波动、下行波动、全部历史回撤和Beta；最大回撤不会单独否决。
-            - 当前时点分按不同周期分别计算，使用均线结构、动量、相对基准、成交量、基本面、市场环境和相似周期后续分布。
-            - 相似周期检索使用收益、波动、回撤、均线位置、成交量和市场基准特征；先使用相似度不低于72分的严格同股样本。
-            - 严格样本不足10个时，系统自动尝试相似度不低于60分的同股样本，并下调可信度；仍不足10个时不形成该期限预测。
-            - 本股样本不可靠时，仅允许高可信度市场基准作不超过正负3分的小幅修正，并清楚标注来源；不会用其他个股冒充样本。
-            - 相似周期最多只对当前时点评分进行有限修正，不会覆盖个人适配、安全限制或数据不足结论。
-            - 20日滚动回测的每个验证时点只使用当时已经可见的数据，用于检查规则是否存在明显失效。
-            - Agent在资金最早使用时间允许的范围内，结合投资目标、看盘条件和退出纪律选择周期。
+            - 行情方向与个人适配分开：用户适合承担风险，不代表股票未来一定上涨。
+            - 价格相对均线和快慢均线已合并为一个趋势块，避免同一趋势信息重复加分。
+            - 动量与相对强弱先按该股票近期正常波动调整；成交量只作量价背景，不再单独加分。
+            - 两个V6.5版本中的4个新候选因子都做了分离检验：20日短期均值回归只保留小权重研究值；52周位置、量价确认和波动率分位仅作背景。
+            - 每个持有期先用历史时点检验固定规则，再检查与当前分数最接近的历史区间。只能保留、减半或阻断信号，不会把失败信号反转；“有限通过”也不能形成可操作方向。
+            - 单只股票内部验证通过后，还必须通过多股票、跨阶段和两批独立留出样本认证。最终封闭检验尚无周期稳定通过，因此当前所有周期只展示观察分，不宣称未来方向。
+            - 持有期先按用户目标、资金期限和执行条件确定，不再从多个周期中挑选当前最高分。
+            - 基本面只对中长期作有限修正；宏观最多修正正负2分。
+            - 相似周期继续展示收益分布，但不参与V6.6生产方向评分。
             - 仓位是风险预算参考值，不是收益承诺，也不等于下单指令。
             - 历史上涨样本占比不等于经过校准的真实上涨概率；所有数值由可检查的量化规则计算。
             """
@@ -2657,7 +2683,7 @@ def page_three() -> None:
             )
             status.write("4/5 识别市场与宏观环境")
             macro = cached_macro(confirmed_market, bundle.benchmark)
-            status.write("5/5 检索历史相似周期，综合资讯、个人适配和风险预算")
+            status.write("5/5 校验各持有期历史稳定性，并综合个人适配和风险预算")
             analysis = analyze_all(bundle, profile, fundamental, macro)
             selected_score = (analysis.get("selected_horizon") or {}).get("score")
             analysis["news_analysis"] = assess_news(news_payload, selected_score)

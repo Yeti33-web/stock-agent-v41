@@ -1,11 +1,54 @@
-# V6.0 永久保存版部署说明（按顺序操作）
+# 历史部署说明（V6.4）
+
+> 当前版本是V6.6。请优先按 [GitHub部署说明_V6.6.md](GitHub部署说明_V6.6.md) 操作；以下内容只保留作为V6.4历史记录。
+
+## 已经正常运行 V6.3 的用户：只做下面三步
+
+### 第一步：上传 GitHub 中六个新版文件
+
+1. 打开原 GitHub 仓库 `stock-agent-v41`。
+2. 点击 **Add file → Upload files**。
+3. 从 V6.4 文件夹选择：
+   - `app.py`
+   - `README.md`
+   - `factor_analysis.py`
+   - `因子字典与历史验证_V6.4.md`
+   - `版本更新清单_V6.4.md`
+   - `test_v64.py`
+4. 保持 **Commit directly to the main branch**，点击 **Commit changes**。
+
+`app.py` 和 `README.md` 会覆盖旧文件，其余是新增文件。不要删除或改名其他文件。
+
+### 第二步：等待网页自动更新
+
+1. 打开 [Streamlit Community Cloud](https://share.streamlit.io/)。
+2. 找到原股票 Agent，等待自动重新部署。
+3. 如果几分钟后仍显示 V6.3，点击应用右侧 `⋮` → **Reboot app**。
+
+本次不需要重新运行 SQL，不需要修改 Streamlit Secrets，也不需要重新设置验证码邮件或 SMTP；已有云端数据不会被清除。
+
+### 第三步：测试因子解释与历史验证
+
+1. 打开原 `.streamlit.app` 网址并登录。
+2. 重新分析任意一只 A股、美股或港股。
+3. 打开结果页的 **因子解释与验证**。
+4. 确认能看到本次贡献图、用户风险分、股票风险分和历史验证表。
+5. 展开完整因子字典，确认可以按模块筛选。
+6. 再打开原有 **最新资讯、卖出信号、加仓适配分析和股票会话**，确认原功能仍正常。
+
+---
+
+## 尚未部署过永久版的用户：完整部署步骤
 
 ## 第一步：上传 GitHub 文件
 
 1. 打开你原来的 GitHub 仓库 `stock-agent-v41`。
 2. 点击 **Add file → Upload files**。
-3. 从解压后的 V6.0 文件夹选择并上传以下文件：
+3. 从解压后的 V6.4 文件夹选择并上传以下文件：
    - `app.py`
+   - `add_position_analysis.py`
+   - `news_analysis.py`
+   - `factor_analysis.py`
    - `agent_core.py`
    - `questionnaire.py`
    - `session_memory.py`
@@ -14,7 +57,10 @@
    - `requirements.txt`
    - `一键建表_V6.0.sql`
    - `README.md`
+   - `因子字典与历史验证_V6.4.md`
+   - `版本更新清单_V6.4.md`
    - `GitHub部署说明.md`
+   - `Supabase注册验证码邮件模板.html`
    - `.gitignore`（如果浏览器不显示隐藏文件，可不上传）
 4. 保持 **Commit directly to the main branch**，点击 **Commit changes**。
 
@@ -53,14 +99,15 @@ SUPABASE_PUBLISHABLE_KEY = "你的 publishable key"
 
 5. 点击 **Save**，再点击 **Reboot app**；如果没有 Reboot 按钮，等待应用自动重启。
 
-## 第五步：首次注册并检查永久保存
+## 第五步：设置验证码邮件并检查永久保存
 
-1. 打开原来的 `.streamlit.app` 网址。
-2. 选择 **首次注册**，填写邮箱和至少8位密码。
-3. 如果页面提示验证邮箱，请到邮箱点击验证链接，再返回网页登录。
-4. 完成风险测评，分析一只股票，并在股票会话中添加一条备注。
-5. 用手机或另一台电脑打开同一网址，以同一邮箱登录。
-6. 能看到风险资料、股票会话和完整分析，即表示永久保存成功。
+1. 先按本说明上方“第二步：把注册邮件改为验证码”设置 Confirm signup 邮件模板。
+2. 打开原来的 `.streamlit.app` 网址。
+3. 选择 **首次注册**，填写邮箱和至少8位密码，发送验证码。
+4. 回到同一网页输入邮件中的验证码，完成验证并自动登录。
+5. 完成风险测评，分析一只股票，并在股票会话中添加一条备注。
+6. 用手机或另一台电脑打开同一网址，以同一邮箱和密码登录。
+7. 能看到风险资料、股票会话和完整分析，即表示永久保存成功。
 
 ## 以后自己或别人怎么使用
 
@@ -82,10 +129,14 @@ SUPABASE_PUBLISHABLE_KEY = "你的 publishable key"
 
 在 Streamlit Community Cloud 中点击 `⋮` → **Reboot app**，等待重新安装依赖。
 
-### 注册后不能立即登录
+### 收到的邮件仍然是确认链接
 
-先检查注册邮箱中的验证邮件；完成验证后再登录。
+说明 Supabase 的 **Confirm signup** 邮件模板还没有改成 `{{ .Token }}`，请重新完成验证码邮件模板设置。
+
+### 显示 email rate limit exceeded
+
+这是 Supabase 邮件发送限额，不是验证码代码错误。不要连续点击，等待限额恢复；多人使用时需配置自定义 SMTP。
 
 ### 能否删除电脑上的压缩包
 
-部署和跨设备验证成功后可以删除。建议保留一份 V6.0 压缩包作为本地备份。
+部署和跨设备验证成功后可以删除。建议保留一份 V6.4 压缩包作为本地备份。

@@ -444,7 +444,7 @@ def fetch_stock_news(market: str, code: str, name: str) -> dict[str, Any]:
 
 
 def _score_label(score: int) -> str:
-    return "条件较积极" if score >= 68 else "中性偏积极" if score >= 56 else "中性观察" if score >= 42 else "偏弱／暂缓"
+    return "条件较积极" if score >= 70 else "中性偏积极" if score >= 60 else "中性观察" if score >= 45 else "偏弱／暂缓"
 
 
 def assess_news(news_payload: Mapping[str, Any], base_score: Any) -> dict[str, Any]:

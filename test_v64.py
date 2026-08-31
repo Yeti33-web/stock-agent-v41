@@ -45,13 +45,14 @@ def fake_safe_float(value):
 
 
 def load_factor_module():
-    fake_agent_core = types.ModuleType("agent_core")
-    fake_agent_core.PriceBundle = FakePriceBundle
-    fake_agent_core.EvidenceSnapshot = FakeEvidenceSnapshot
-    fake_agent_core.safe_float = fake_safe_float
+    core_path = Path(__file__).with_name("agent_core.py")
+    core_spec = importlib.util.spec_from_file_location("agent_core", core_path)
+    fake_agent_core = importlib.util.module_from_spec(core_spec)
+    assert core_spec and core_spec.loader
     original = sys.modules.get("agent_core")
     sys.modules["agent_core"] = fake_agent_core
     try:
+        core_spec.loader.exec_module(fake_agent_core)
         path = Path(__file__).with_name("factor_analysis.py")
         spec = importlib.util.spec_from_file_location("factor_analysis_under_test", path)
         module = importlib.util.module_from_spec(spec)
@@ -135,7 +136,7 @@ def synthetic_inputs():
 class FactorAnalysisV64Tests(unittest.TestCase):
     def test_full_catalog_is_complete_and_auditable(self):
         rows = FACTOR.factor_catalog()
-        self.assertEqual(len(rows), 85)
+        self.assertEqual(len(rows), 91)
         expected_columns = {"模块", "因子", "计算公式／规则", "数据要求", "方向", "当前权重／分值", "缺失数据处理"}
         self.assertTrue(all(set(row) == expected_columns for row in rows))
         modules = {row["模块"] for row in rows}

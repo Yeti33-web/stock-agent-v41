@@ -28,6 +28,45 @@ except ImportError:
 
 
 HISTORY_YEARS = 5
+MODEL_VERSION = "V6.6"
+MODEL_RULESET_ID = "fused-point-in-time-v1"
+
+# A horizon may form a directional conclusion only after it has remained
+# positive across development stocks, later dates and a separate market
+# sample.  This table is deliberately conservative.  The final sealed audit
+# found that the apparent five-day edge did not repeat on a second untouched
+# stock set, so no market/horizon is currently certified.  An uncertified horizon
+# still shows its score and factors, but cannot create a buy direction or
+# position budget.  Hong Kong and funds remain un-certified until their own
+# independent holdout audits are completed.
+DIRECTION_CERTIFICATION: dict[str, set[int]] = {
+    "A股个股": set(),
+    "美股个股": set(),
+    "港股个股": set(),
+    "场内基金": set(),
+}
+
+
+def direction_certification(asset_type: str | None, days: int) -> dict[str, Any]:
+    scope = str(asset_type or "未指定证券类型")
+    certified = int(days) in DIRECTION_CERTIFICATION.get(scope, set())
+    if certified:
+        reason = "该市场的本周期已通过多股票、跨阶段和独立留出样本检查。"
+    elif int(days) == 5:
+        reason = "该周期在第二批独立股票样本中未稳定复现，暂不允许形成方向结论。"
+    elif int(days) in {20, 60}:
+        reason = "该周期在跨股票或跨市场留出样本中方向不稳定，暂不允许形成方向结论。"
+    elif int(days) in {120, 250}:
+        reason = "五年窗口内可形成的独立长期样本不足，暂不允许形成方向结论。"
+    else:
+        reason = "该证券类型尚未完成独立样本认证，暂不允许形成方向结论。"
+    return {
+        "status": "已认证" if certified else "未认证",
+        "certified": certified,
+        "asset_type": scope,
+        "days": int(days),
+        "reason": reason,
+    }
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 StockResearchAgent/5.7"}
 SEC_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "IndividualInvestorResearchAgent/5.7 educational-use")}
 
@@ -100,8 +139,12 @@ ANALOG_HORIZONS: list[dict[str, Any]] = [
 ANALOG_MIN_SAMPLES = 10
 ANALOG_MIN_SIMILARITY = 72.0
 ANALOG_FALLBACK_MIN_SIMILARITY = 60.0
-ANALOG_SCORE_MIN_CONFIDENCE = 35
-ANALOG_MARKET_MIN_CONFIDENCE = 55
+# V6.6 keeps historical analogues as an explanatory scenario tool.  The
+# earlier +/-8 point production adjustment was too large relative to its
+# unstable walk-forward results, so it no longer changes the buy-side score.
+ANALOG_SCORE_MIN_CONFIDENCE = 60
+ANALOG_MARKET_MIN_CONFIDENCE = 70
+ANALOG_SCORE_ENABLED = False
 ANALOG_FEATURE_WEIGHTS: dict[str, float] = {
     "return_5": 0.05,
     "return_20": 0.10,
@@ -2027,14 +2070,303 @@ def _analog_adjustment_value(
     )
 
 
+def _timing_rank_ic(signal: pd.Series, outcome: pd.Series) -> float | None:
+    pair = pd.concat(
+        [signal.rename("signal"), outcome.rename("outcome")],
+        axis=1,
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(pair) < 8 or pair["signal"].nunique() < 2 or pair["outcome"].nunique() < 2:
+        return None
+    value = pair["signal"].rank(method="average").corr(
+        pair["outcome"].rank(method="average")
+    )
+    return float(value) if value is not None and np.isfinite(value) else None
+
+
+def _technical_timing_frame(
+    close: pd.Series,
+    volume: pd.Series,
+    benchmark_close: pd.Series,
+    config: dict[str, Any],
+) -> pd.DataFrame:
+    """Build the V6.6 directional factors at every visible historical date.
+
+    Trend is one combined block so price/MA and MA/MA cannot be counted twice.
+    Momentum and relative strength are scaled by the stock's recent volatility,
+    which makes a five-percent move comparable across low- and high-volatility
+    securities.  Volume is retained as context but deliberately scores zero:
+    higher volume alone does not say whether price should rise or fall.  The
+    only added directional rule is a 20-day mean-reversion adjustment already
+    present in the second candidate version.  It was retained only for the
+    20-day horizon where the pre-2023 development sample improved; it is not
+    applied to 5, 60, 120 or 250 days.
+    """
+
+    days = int(config["days"])
+    fast = int(config["fast"])
+    slow = int(config["slow"])
+    fast_ma = close.rolling(fast, min_periods=fast).mean()
+    slow_ma = close.rolling(slow, min_periods=slow).mean()
+    valid_ma = fast_ma.notna() & slow_ma.notna()
+    price_above_fast = close >= fast_ma
+    fast_above_slow = fast_ma >= slow_ma
+    trend_points = pd.Series(0.0, index=close.index)
+    trend_points.loc[valid_ma & price_above_fast & fast_above_slow] = 10.0
+    trend_points.loc[valid_ma & ~price_above_fast & ~fast_above_slow] = -10.0
+    trend_points.loc[~valid_ma] = np.nan
+
+    stock_return = close.pct_change(days, fill_method=None)
+    daily_volatility = close.pct_change(fill_method=None).rolling(
+        60,
+        min_periods=40,
+    ).std()
+    expected_move = (daily_volatility * np.sqrt(days)).replace(0, np.nan)
+    momentum_signal = (stock_return / (2.0 * expected_move)).clip(-1, 1)
+    momentum_points = momentum_signal * 8.0
+
+    benchmark_available = isinstance(benchmark_close, pd.Series) and not benchmark_close.empty
+    if benchmark_available:
+        benchmark_aligned = benchmark_close.reindex(close.index).ffill()
+        benchmark_return = benchmark_aligned.pct_change(days, fill_method=None)
+        excess_return = stock_return - benchmark_return
+        relative_signal = (excess_return / (2.0 * expected_move)).clip(-1, 1)
+        relative_points = relative_signal * 7.0
+        future_benchmark_return = benchmark_aligned.shift(-days) / benchmark_aligned - 1
+    else:
+        benchmark_return = pd.Series(np.nan, index=close.index)
+        excess_return = pd.Series(np.nan, index=close.index)
+        relative_signal = pd.Series(np.nan, index=close.index)
+        relative_points = pd.Series(0.0, index=close.index)
+        future_benchmark_return = pd.Series(np.nan, index=close.index)
+
+    volume_ratio = volume.rolling(20, min_periods=20).mean() / volume.rolling(
+        60,
+        min_periods=60,
+    ).mean()
+    volume_context = np.sign(stock_return) * np.log(volume_ratio.clip(lower=0.20, upper=5.0))
+
+    ret10 = close.pct_change(10, fill_method=None)
+    ret10_mean = ret10.rolling(250, min_periods=120).mean()
+    ret10_std = ret10.rolling(250, min_periods=120).std(ddof=1)
+    ret10_zscore = (ret10 - ret10_mean) / ret10_std.replace(0, np.nan)
+    short_reversal_adjustment = pd.Series(0.0, index=close.index)
+    if days == 20:
+        short_reversal_adjustment = np.where(
+            ret10_zscore >= 1.0,
+            -np.clip((ret10_zscore - 0.8) * 3.0, 0.0, 5.0),
+            np.where(
+                ret10_zscore <= -1.0,
+                np.clip((0.8 - ret10_zscore) * 1.8, 0.0, 3.0),
+                0.0,
+            ),
+        )
+        short_reversal_adjustment = pd.Series(short_reversal_adjustment, index=close.index).fillna(0.0)
+
+    high_252 = close.rolling(252, min_periods=252).max()
+    position_52_week = close / high_252.replace(0, np.nan) - 1.0
+    avg10 = volume.rolling(10, min_periods=10).mean()
+    avg30 = volume.rolling(30, min_periods=30).mean()
+    short_volume_ratio = avg10 / avg30.replace(0, np.nan)
+    price_volume_confirmation = pd.Series("中性", index=close.index, dtype="object")
+    price_volume_confirmation.loc[(ret10 > 0.02) & (short_volume_ratio > 1.15)] = "放量上涨"
+    price_volume_confirmation.loc[(ret10 > 0.02) & (short_volume_ratio < 0.95)] = "缩量上涨"
+    price_volume_confirmation.loc[(ret10 < -0.02) & (short_volume_ratio > 1.15)] = "放量下跌"
+    annual_volatility_20 = close.pct_change(fill_method=None).rolling(20, min_periods=20).std(ddof=1) * np.sqrt(252)
+    volatility_percentile = annual_volatility_20.rolling(250, min_periods=120).rank(pct=True)
+
+    raw_score = 50.0 + trend_points + momentum_points + relative_points + short_reversal_adjustment
+    future_return = close.shift(-days) / close - 1
+    future_target = future_return - future_benchmark_return if benchmark_available else future_return
+
+    return pd.DataFrame(
+        {
+            "fast_ma": fast_ma,
+            "slow_ma": slow_ma,
+            "price_above_fast": price_above_fast,
+            "fast_above_slow": fast_above_slow,
+            "stock_return": stock_return,
+            "benchmark_return": benchmark_return,
+            "excess_return": excess_return,
+            "volume_ratio": volume_ratio,
+            "volume_context": volume_context,
+            "trend_points": trend_points,
+            "momentum_points": momentum_points,
+            "relative_points": relative_points,
+            "short_reversal_adjustment": short_reversal_adjustment,
+            "ret10_zscore": ret10_zscore,
+            "position_52_week": position_52_week,
+            "short_volume_ratio": short_volume_ratio,
+            "price_volume_confirmation": price_volume_confirmation,
+            "volatility_percentile": volatility_percentile,
+            "raw_score": raw_score,
+            "future_return": future_return,
+            "future_target": future_target,
+        },
+        index=close.index,
+    )
+
+
+def _validate_timing_signal(frame: pd.DataFrame, days: int) -> dict[str, Any]:
+    """Validate the fixed technical score using outcomes already known by T.
+
+    This is a gate, not an optimiser: it may keep, halve or suppress a signal,
+    but it never searches for a more flattering weight or reverses a failed
+    factor after seeing the answer.
+    """
+
+    usable = frame[["raw_score", "future_target"]].replace(
+        [np.inf, -np.inf],
+        np.nan,
+    ).dropna()
+    stride = max(5, int(round(days / 4)))
+    usable = usable.iloc[::stride].copy()
+    samples = int(len(usable))
+    minimum_samples = 40 if days <= 20 else 30 if days <= 60 else 24 if days <= 120 else 16
+    current_score = float(frame["raw_score"].dropna().iloc[-1]) if frame["raw_score"].notna().any() else 50.0
+    current_direction = int(np.sign(current_score - 50.0))
+    signal = usable["raw_score"] - 50.0
+    outcome = usable["future_target"]
+    ic = _timing_rank_ic(signal, outcome)
+    midpoint = samples // 2
+    first_ic = _timing_rank_ic(signal.iloc[:midpoint], outcome.iloc[:midpoint]) if midpoint >= 8 else None
+    second_ic = _timing_rank_ic(signal.iloc[midpoint:], outcome.iloc[midpoint:]) if samples - midpoint >= 8 else None
+
+    active = usable.loc[signal.abs() >= 4.0].copy()
+    hit_rate = None
+    if len(active) >= 12:
+        active_signal = active["raw_score"] - 50.0
+        hit_rate = float(((active_signal > 0) == (active["future_target"] > 0)).mean())
+
+    spread = None
+    if samples >= 16 and signal.nunique() >= 5:
+        lower = signal.quantile(0.25)
+        upper = signal.quantile(0.75)
+        low_outcomes = outcome[signal <= lower]
+        high_outcomes = outcome[signal >= upper]
+        if not low_outcomes.empty and not high_outcomes.empty:
+            spread = float(high_outcomes.median() - low_outcomes.median())
+
+    local_band_count = 0
+    local_direction_hit_rate = None
+    local_signed_median = None
+    if samples >= 12 and current_direction != 0:
+        local_band_count = min(samples, max(12, int(np.ceil(samples * 0.25))))
+        nearest = (usable["raw_score"] - current_score).abs().nsmallest(local_band_count).index
+        local_outcomes = usable.loc[nearest, "future_target"]
+        local_direction_hit_rate = float(
+            ((local_outcomes > 0) if current_direction > 0 else (local_outcomes < 0)).mean()
+        )
+        local_signed_median = float(local_outcomes.median() * current_direction)
+
+    local_supports = bool(
+        local_direction_hit_rate is not None
+        and local_direction_hit_rate >= 0.52
+        and local_signed_median is not None
+        and local_signed_median > 0
+    )
+    local_strongly_opposes = bool(
+        local_direction_hit_rate is not None
+        and local_direction_hit_rate < 0.45
+        and local_signed_median is not None
+        and local_signed_median < 0
+    )
+
+    global_passed = bool(
+        samples >= minimum_samples
+        and ic is not None
+        and ic >= 0.03
+        and first_ic is not None
+        and first_ic > 0
+        and second_ic is not None
+        and second_ic > 0
+        and spread is not None
+        and spread > 0
+        and hit_rate is not None
+        and hit_rate >= 0.52
+    )
+    global_limited = bool(
+        not global_passed
+        and samples >= minimum_samples
+        and ic is not None
+        and ic > 0
+        and second_ic is not None
+        and second_ic >= 0
+        and spread is not None
+        and spread > 0
+        and hit_rate is not None
+        and hit_rate >= 0.50
+    )
+    passed = bool(global_passed and local_supports)
+    limited = bool(
+        not passed
+        and (global_passed or global_limited)
+        and not local_strongly_opposes
+    )
+
+    if passed:
+        status = "通过"
+        reliability_multiplier = 1.0
+    elif limited:
+        status = "有限通过"
+        reliability_multiplier = 0.5
+    else:
+        status = "未通过"
+        reliability_multiplier = 0.0
+
+    sample_points = min(samples / max(minimum_samples, 1), 1.0) * 25
+    ic_points = float(np.clip((ic or 0.0) / 0.10, 0, 1) * 25)
+    stability_points = 20 if first_ic is not None and second_ic is not None and first_ic > 0 and second_ic > 0 else 8 if second_ic is not None and second_ic >= 0 else 0
+    spread_points = 15 if spread is not None and spread > 0 else 0
+    hit_points = 15 if hit_rate is not None and hit_rate >= 0.55 else 8 if hit_rate is not None and hit_rate >= 0.52 else 3 if hit_rate is not None and hit_rate >= 0.50 else 0
+    local_points = 10 if local_supports else 4 if not local_strongly_opposes else 0
+    confidence = int(round(np.clip(sample_points + ic_points + stability_points + spread_points + hit_points + local_points, 0, 90)))
+    if status == "未通过":
+        confidence = min(confidence, 39)
+    elif status == "有限通过":
+        confidence = min(max(confidence, 45), 59)
+    else:
+        confidence = max(confidence, 60)
+
+    if samples < minimum_samples:
+        reason = f"只有{samples}个历史验证时点，低于最低要求{minimum_samples}个。"
+    elif status == "通过":
+        reason = "整体历史验证及当前相近分数区间均支持该方向。"
+    elif status == "有限通过":
+        reason = "整体历史方向初步为正，且当前相近分数区间未明显反对；技术分只保留一半影响。"
+    else:
+        reason = "整体历史验证或当前相近分数区间至少一项未达到要求。"
+
+    return {
+        "status": status,
+        "confidence_score": confidence,
+        "reliability_multiplier": reliability_multiplier,
+        "samples": samples,
+        "minimum_samples": minimum_samples,
+        "stride": stride,
+        "rank_ic": ic,
+        "first_half_ic": first_ic,
+        "second_half_ic": second_ic,
+        "hit_rate": hit_rate,
+        "high_low_spread": spread,
+        "current_raw_score": current_score,
+        "local_band_count": local_band_count,
+        "local_direction_hit_rate": local_direction_hit_rate,
+        "local_signed_median_return": local_signed_median,
+        "local_strongly_opposes": local_strongly_opposes,
+        "reason": reason,
+    }
+
+
 def score_horizons(
     metrics: dict[str, Any],
     fundamental: EvidenceSnapshot,
     macro: EvidenceSnapshot,
     analog_forecast: dict[str, Any] | None = None,
     market_analog_forecast: dict[str, Any] | None = None,
+    asset_type: str | None = None,
 ) -> list[dict[str, Any]]:
     close: pd.Series = metrics["close"]
+    volume: pd.Series = metrics["volume"]
     benchmark_close: pd.Series = metrics["benchmark_close"]
     results: list[dict[str, Any]] = []
     for config in HORIZONS:
@@ -2050,6 +2382,12 @@ def score_horizons(
                     "analog_used": False,
                     "analog_source": "未使用",
                     "analog_status": "缺少分钟／实时数据，不做次日相似修正",
+                    "signal_confidence": 0,
+                    "direction_available": False,
+                    "signal_validation": {
+                        "status": "不可验证",
+                        "reason": "缺少分钟级、实时盘口和交易成本数据。",
+                    },
                     "reasons": ["当前免费接口只提供日线，不能可靠判断下一交易日涨跌。"],
                 }
             )
@@ -2066,48 +2404,140 @@ def score_horizons(
                     "analog_used": False,
                     "analog_source": "未使用",
                     "analog_status": f"行情仅{len(close)}日，最低需要{config['minimum_rows']}日",
+                    "signal_confidence": 0,
+                    "direction_available": False,
+                    "signal_validation": {
+                        "status": "样本不足",
+                        "reason": f"行情仅{len(close)}日，最低需要{config['minimum_rows']}日。",
+                    },
                     "reasons": [f"需要至少{config['minimum_rows']}个交易日，当前只有{len(close)}个。"],
                 }
             )
             continue
-        fast_ma = close.rolling(config["fast"]).mean().iloc[-1]
-        slow_ma = close.rolling(config["slow"]).mean().iloc[-1]
-        stock_return = _return_over(close, config["days"])
-        benchmark_return = _return_over(benchmark_close, config["days"])
-        score = 50.0
+
+        factor_frame = _technical_timing_frame(close, volume, benchmark_close, config)
+        current = factor_frame.iloc[-1]
+        if not np.isfinite(float(current["raw_score"])):
+            results.append(
+                {
+                    **config,
+                    "available": False,
+                    "score": None,
+                    "label": "技术指标不足",
+                    "analog_adjustment": 0.0,
+                    "analog_evidence": None,
+                    "analog_used": False,
+                    "analog_source": "未使用",
+                    "analog_status": "技术指标尚未形成完整窗口",
+                    "signal_confidence": 0,
+                    "direction_available": False,
+                    "signal_validation": {
+                        "status": "样本不足",
+                        "reason": "当前均线或波动率窗口尚不完整。",
+                    },
+                    "reasons": ["当前均线或波动率窗口尚不完整。"],
+                }
+            )
+            continue
+
+        validation = _validate_timing_signal(factor_frame, int(config["days"]))
+        certification = direction_certification(asset_type, int(config["days"]))
+        if not certification["certified"]:
+            validation = {
+                **validation,
+                "status": "未通过",
+                "confidence_score": min(int(validation.get("confidence_score") or 0), 39),
+                "reliability_multiplier": 0.0,
+                "within_security_status": validation.get("status"),
+                "within_security_reason": validation.get("reason"),
+                "reason": certification["reason"],
+            }
+        validation["cross_security_certification"] = certification
+        reliability_multiplier = float(validation["reliability_multiplier"])
+        raw_technical_score = float(current["raw_score"])
+        trend_points = float(current["trend_points"]) * reliability_multiplier
+        momentum_points = float(current["momentum_points"]) * reliability_multiplier
+        relative_points = float(current["relative_points"]) * reliability_multiplier
+        short_reversal_points = float(current["short_reversal_adjustment"]) * reliability_multiplier
+        score = 50.0 + trend_points + momentum_points + relative_points + short_reversal_points
+        stock_return = safe_float(current["stock_return"])
+        benchmark_return = safe_float(current["benchmark_return"])
+        volume_ratio = safe_float(current["volume_ratio"])
+        ret10_zscore = safe_float(current["ret10_zscore"])
+        position_52_week = safe_float(current["position_52_week"])
+        short_volume_ratio = safe_float(current["short_volume_ratio"])
+        price_volume_confirmation = str(current["price_volume_confirmation"])
+        volatility_percentile = safe_float(current["volatility_percentile"])
         reasons: list[str] = []
-        if close.iloc[-1] >= fast_ma:
-            score += 8
-            reasons.append(f"现价位于{config['fast']}日均线之上")
+
+        raw_trend_points = float(current["trend_points"])
+        if raw_trend_points > 0:
+            reasons.append(
+                f"现价位于{config['fast']}日均线上方，且快线位于{config['slow']}日均线上方"
+            )
+        elif raw_trend_points < 0:
+            reasons.append(
+                f"现价位于{config['fast']}日均线下方，且快线位于{config['slow']}日均线下方"
+            )
         else:
-            score -= 8
-            reasons.append(f"现价位于{config['fast']}日均线之下")
-        if fast_ma >= slow_ma:
-            score += 8
-            reasons.append("快慢均线结构偏强")
-        else:
-            score -= 8
-            reasons.append("快慢均线结构偏弱")
-        scale = 220 if config["days"] <= 5 else 100 if config["days"] <= 20 else 50 if config["days"] <= 60 else 25 if config["days"] <= 120 else 15
-        if np.isfinite(stock_return):
-            score += float(np.clip(stock_return * scale, -12, 12))
-        if np.isfinite(stock_return) and np.isfinite(benchmark_return):
+            reasons.append("价格与快慢均线信号不一致，趋势暂未确认")
+
+        if stock_return is not None:
+            reasons.append(f"近{config['days']}个交易日收益{stock_return:.3%}")
+        if stock_return is not None and benchmark_return is not None:
             excess = stock_return - benchmark_return
-            score += float(np.clip(excess * 50, -10, 10))
             reasons.append("同期跑赢市场基准" if excess > 0 else "同期弱于市场基准")
-        if np.isfinite(metrics["volume_ratio"]):
-            if metrics["volume_ratio"] >= 1.2:
-                score += 4
-                reasons.append("近期成交量有所放大")
-            elif metrics["volume_ratio"] <= 0.75:
-                score -= 3
-        macro_weight = 0.10 if config["days"] <= 20 else 0.16
+        if volume_ratio is not None and volume_ratio >= 1.20:
+            direction_text = "上涨" if (stock_return or 0.0) > 0 else "下跌" if (stock_return or 0.0) < 0 else "横盘"
+            reasons.append(f"近期成交量放大且价格{direction_text}；成交量仅作确认，不再单独加分")
+        elif volume_ratio is not None and volume_ratio <= 0.75:
+            reasons.append("近期成交量明显收缩；仅作流动性提示，不再单独扣分")
+        if float(current["short_reversal_adjustment"]) < 0:
+            reasons.append(
+                f"近10日涨幅处于自身历史极端区间"
+                f"{f'（z={ret10_zscore:.2f}）' if ret10_zscore is not None else ''}，"
+                "20日均值回归修正下调当前分数"
+            )
+        elif float(current["short_reversal_adjustment"]) > 0:
+            reasons.append(
+                f"近10日涨幅处于自身历史偏低区间"
+                f"{f'（z={ret10_zscore:.2f}）' if ret10_zscore is not None else ''}，"
+                "20日均值回归修正小幅上调当前分数"
+            )
+        if position_52_week is not None:
+            reasons.append(f"现价距近52周高点{position_52_week:.3%}；该项仅展示，不重复计入趋势分")
+        if price_volume_confirmation != "中性":
+            reasons.append(f"近期量价状态为“{price_volume_confirmation}”；仅作背景确认")
+        if volatility_percentile is not None and volatility_percentile >= 0.85:
+            reasons.append("当前20日波动率处于自身近一年高位；用于风险提示，不改写方向")
+
+        macro_weight = 0.08 if config["days"] <= 20 else 0.10
+        macro_points = 0.0
         if macro.score is not None:
-            score += (macro.score - 50) * macro_weight
-        fundamental_weight = 0.04 if config["days"] <= 20 else 0.10 if config["days"] <= 60 else 0.20
+            macro_points = float(np.clip((macro.score - 50) * macro_weight, -2.0, 2.0))
+            score += macro_points
+        fundamental_weight = (
+            0.0
+            if config["days"] <= 20
+            else 0.06
+            if config["days"] <= 60
+            else 0.10
+            if config["days"] <= 120
+            else 0.12
+        )
+        fundamental_points = 0.0
         if fundamental.score is not None:
-            score += (fundamental.score - 50) * fundamental_weight
-            reasons.append("基本面评分提供支持" if fundamental.score >= 55 else "基本面评分未形成明显支持")
+            fundamental_points = float(
+                np.clip((fundamental.score - 50) * fundamental_weight, -4.0, 4.0)
+            )
+            score += fundamental_points
+            if fundamental_weight > 0:
+                reasons.append(
+                    "基本面评分提供有限支持"
+                    if fundamental.score >= 55
+                    else "基本面评分未形成明显支持"
+                )
+
         analog_adjustment = 0.0
         stock_analog_result = next(
             (
@@ -2127,73 +2557,44 @@ def score_horizons(
         )
         stock_analog_evidence = stock_analog_result if stock_analog_result and stock_analog_result.get("available") else None
         market_analog_evidence = market_analog_result if market_analog_result and market_analog_result.get("available") else None
-        analog_evidence = stock_analog_evidence
+        analog_evidence = stock_analog_evidence or market_analog_evidence
         analog_used = False
-        analog_source = "未使用"
-        analog_status = ""
-        if stock_analog_evidence and int(stock_analog_evidence.get("confidence_score", 0)) >= ANALOG_SCORE_MIN_CONFIDENCE:
-            analog_evidence = stock_analog_evidence
-            positive_ratio = float(analog_evidence["positive_ratio"])
-            median_return = float(analog_evidence["median_return"])
-            adaptive = analog_evidence.get("selection_mode") == "自适应同股样本"
-            analog_adjustment = _analog_adjustment_value(
-                analog_evidence,
-                int(config["days"]),
-                5.0 if adaptive else 8.0,
-            )
-            score += analog_adjustment
-            analog_used = True
-            analog_source = str(analog_evidence.get("selection_mode") or "严格同股样本")
+        analog_source = "仅展示"
+        if analog_evidence:
+            sample_count = int(analog_evidence.get("sample_count", 0))
+            confidence_value = int(analog_evidence.get("confidence_score", 0))
             analog_status = (
-                f"{analog_adjustment:+.1f}分（{analog_source}，"
-                f"{int(analog_evidence['sample_count'])}个，可信度{int(analog_evidence['confidence_score'])}/100）"
+                f"V6.6仅展示、不计分（{sample_count}个样本，可信度{confidence_value}/100）"
             )
-            reasons.append(
-                f"{analog_source}{analog_evidence['sample_count']}个：历史上涨占比{positive_ratio:.3%}，"
-                f"中位收益{median_return:.3%}"
-            )
-        elif market_analog_evidence and int(market_analog_evidence.get("confidence_score", 0)) >= ANALOG_MARKET_MIN_CONFIDENCE:
-            analog_evidence = market_analog_evidence
-            analog_adjustment = _analog_adjustment_value(
-                market_analog_evidence,
-                int(config["days"]),
-                3.0,
-            )
-            score += analog_adjustment
-            analog_used = True
-            analog_source = f"市场基准：{(market_analog_forecast or {}).get('source_label', '公开基准')}"
-            stock_reason = str((stock_analog_result or {}).get("reason") or "个股同周期样本不足")
-            if stock_analog_evidence:
-                stock_gate_summary = (
-                    f"个股已有{int(stock_analog_evidence.get('sample_count', 0))}个"
-                    f"{stock_analog_evidence.get('selection_mode', '同股')}样本，"
-                    f"但可信度{int(stock_analog_evidence.get('confidence_score', 0))}/100"
-                    f"低于{ANALOG_SCORE_MIN_CONFIDENCE}/100"
-                )
-            else:
-                stock_gate_summary = "个股样本数未达到最低要求"
-            analog_status = (
-                f"{analog_adjustment:+.1f}分（{analog_source}，"
-                f"{int(market_analog_evidence['sample_count'])}个；{stock_gate_summary}）"
-            )
-            reasons.append(
-                f"{stock_gate_summary}；采用高可信度{analog_source}作不超过±3分的小幅修正。"
-                f"个股说明：{stock_reason}"
-            )
-        elif stock_analog_evidence:
-            analog_status = (
-                f"同股样本{int(stock_analog_evidence['sample_count'])}个，"
-                f"可信度{int(stock_analog_evidence.get('confidence_score', 0))}/100，未参与修正"
-            )
-            reasons.append("相似周期历史回测可信度不足，已展示但未参与评分")
         elif stock_analog_result:
-            analog_status = str(stock_analog_result.get("reason") or "同股有效样本不足")
+            analog_status = f"仅展示、不计分：{stock_analog_result.get('reason') or '同股有效样本不足'}"
         elif int(config["days"]) >= 250:
-            analog_status = "近五年窗口不足以可靠检验250日后续表现，暂不修正"
+            analog_status = "近五年窗口不足以可靠检验250日后续表现；不计分"
         else:
-            analog_status = "当前期限没有可用的相似周期模型"
+            analog_status = "当前期限没有可用的相似周期样本；不计分"
+
+        signal_confidence = int(validation["confidence_score"])
+        # "有限通过" remains visible as a research score, but it is not
+        # strong enough to create a buy/sell direction or position budget.
+        direction_available = bool(
+            validation["status"] == "通过"
+            and signal_confidence >= 60
+        )
         score_int = int(round(np.clip(score, 0, 100)))
-        label = "条件较积极" if score_int >= 68 else "中性偏积极" if score_int >= 56 else "中性观察" if score_int >= 42 else "偏弱／暂缓"
+        if not direction_available:
+            label = "历史验证未通过／不判断方向"
+        elif score_int >= 70:
+            label = "条件较积极"
+        elif score_int >= 60:
+            label = "中性偏积极"
+        elif score_int >= 45:
+            label = "中性观察"
+        else:
+            label = "偏弱／暂缓"
+        reasons.append(
+            f"本期限历史验证：{validation['status']}，可信度{signal_confidence}/100；"
+            f"{validation['reason']}"
+        )
         stress_returns = close.pct_change(config["days"]).dropna()
         stress_loss = abs(float(stress_returns.quantile(0.05))) if not stress_returns.empty else np.nan
         historical_worst = float(stress_returns.min()) if not stress_returns.empty else np.nan
@@ -2207,6 +2608,29 @@ def score_horizons(
                 "benchmark_return": benchmark_return,
                 "stress_loss": stress_loss,
                 "historical_worst": historical_worst,
+                "raw_technical_score": raw_technical_score,
+                "technical_reliability_multiplier": reliability_multiplier,
+                "signal_confidence": signal_confidence,
+                "direction_available": direction_available,
+                "signal_validation": validation,
+                "cross_security_certification": certification,
+                "factor_contributions": {
+                    "trend": trend_points,
+                    "momentum": momentum_points,
+                    "relative_strength": relative_points,
+                    "short_reversal": short_reversal_points,
+                    "volume": 0.0,
+                    "macro": macro_points,
+                    "fundamental": fundamental_points,
+                    "historical_analog": 0.0,
+                },
+                "context_factors": {
+                    "ret10_zscore": ret10_zscore,
+                    "position_52_week": position_52_week,
+                    "short_volume_ratio": short_volume_ratio,
+                    "price_volume_confirmation": price_volume_confirmation,
+                    "volatility_percentile": volatility_percentile,
+                },
                 "analog_adjustment": analog_adjustment,
                 "analog_evidence": analog_evidence,
                 "stock_analog_result": stock_analog_result,
@@ -2246,12 +2670,24 @@ def choose_horizon(horizon_scores: list[dict[str, Any]], profile: dict[str, Any]
                 operational -= 7
             if profile["experience"] in {"没有经验", "不足1年"}:
                 operational -= 6
-        item["selection_score"] = item["score"] + priors.get(item["name"], 0) + operational
+        signal_confidence = int(item.get("signal_confidence") or 0)
+        confidence_adjustment = float(np.clip((signal_confidence - 50) * 0.12, -6, 6))
+        if item.get("direction_available"):
+            confidence_adjustment += 4
+        # V6.4 chose the largest current score, which could cherry-pick the
+        # most flattering horizon. V6.6 chooses the horizon from the user's
+        # objective, liquidity and ability to execute, then evaluates the
+        # direction inside that fixed horizon.
+        item["selection_score"] = priors.get(item["name"], 0) + operational + confidence_adjustment
     selected = max(candidates, key=lambda item: item["selection_score"])
     if profile["goal"] == "短线交易" and selected["name"] != "2—5个交易日":
         notes.append("短线意向与看盘条件、纪律或市场信号不匹配，因此Agent没有选择最短周期。")
     if profile["earliest_need"] in {"1周内", "1个月内"}:
         notes.append("资金近期可能使用，任何股票持有周期都存在被迫在不利价格退出的风险。")
+    if not selected.get("direction_available"):
+        notes.append("该持有期由用户目标和资金期限确定，但历史验证未通过，因此不形成买入方向判断。")
+    else:
+        notes.append("持有期先按用户目标、资金期限和执行条件确定，没有从多个周期中挑选最高分。")
     return selected, notes
 
 
@@ -2334,6 +2770,14 @@ def position_budget(
 ) -> dict[str, Any]:
     if selected_horizon is None or suitability_result["fit"] in {"不适配", "证据不足"}:
         return {"lower_pct": 0.0, "upper_pct": 0.0, "lower_amount": 0.0, "upper_amount": 0.0, "stress_loss": None}
+    if not selected_horizon.get("direction_available"):
+        return {
+            "lower_pct": 0.0,
+            "upper_pct": 0.0,
+            "lower_amount": 0.0,
+            "upper_amount": 0.0,
+            "stress_loss": selected_horizon.get("stress_loss"),
+        }
     risk_budget = {1: 0.0025, 2: 0.005, 3: 0.010, 4: 0.020, 5: 0.030}[investor_level_number]
     cap = {1: 0.03, 2: 0.05, 3: 0.10, 4: 0.15, 5: 0.20}[investor_level_number]
     stress_loss = max(float(selected_horizon.get("stress_loss") or 0.0), 0.08)
@@ -2346,9 +2790,9 @@ def position_budget(
     if concentration in {"30%—50%", "超过50%"}:
         upper *= 0.60
     timing_score = selected_horizon["score"]
-    if timing_score < 42:
+    if timing_score < 45:
         upper = 0.0
-    elif timing_score < 56:
+    elif timing_score < 60:
         upper *= 0.50
     lower = upper * 0.40 if upper > 0 else 0.0
     assets = float(profile["investable_assets"])
@@ -2371,9 +2815,16 @@ def build_final_conclusion(
         return "证据不足，暂不形成判断", "公开数据完整度不足，需要更可靠的数据源。"
     if fit == "不适配":
         return "不适合该用户", suitability_result["fit_reason"]
-    if selected_horizon["score"] < 42:
+    if not selected_horizon.get("direction_available"):
+        validation = selected_horizon.get("signal_validation") or {}
+        return (
+            "个人条件可讨论，但方向证据不足",
+            f"所选持有期的历史验证{validation.get('status', '未通过')}，"
+            "因此本版不把当前技术状态解释为买入信号。",
+        )
+    if selected_horizon["score"] < 45:
         return "个人条件可讨论，但当前时点暂缓", "股票与用户并非绝对不匹配，但当前多周期信号偏弱。"
-    if selected_horizon["score"] < 56 or position["upper_pct"] <= 0.02:
+    if selected_horizon["score"] < 60 or position["upper_pct"] <= 0.02:
         return "可以小仓观察", "当前证据尚不支持较高风险预算，重点观察后续信号。"
     if fit == "有限适配":
         return "条件适配，可进一步研究", "风险等级略高于用户等级，需要严格限制仓位并按期复核。"
@@ -2746,6 +3197,7 @@ def analyze_all(
         macro,
         analog_forecast,
         market_analog_forecast,
+        bundle.asset_type,
     )
     selected_horizon, horizon_notes = choose_horizon(horizon_scores, profile)
     confidence, confidence_notes = calculate_data_confidence(metrics, fundamental, macro, bundle.asset_type)
@@ -2770,8 +3222,10 @@ def analyze_all(
         conclusion_reason += (
             f" 相似历史状态后{selected_analog['days']}个交易日上涨样本占比"
             f"{selected_analog['positive_ratio']:.3%}，中位收益{selected_analog['median_return']:.3%}；"
-            "该频率不等于确定概率。"
+            "该频率仅作情景展示，不参与V6.6评分，也不等于确定概率。"
         )
+    market_signal = selected_horizon.get("label") if selected_horizon else "证据不足"
+    signal_confidence = int(selected_horizon.get("signal_confidence") or 0) if selected_horizon else 0
     return {
         "metrics": metrics,
         "investor_score": investor_score,
@@ -2785,6 +3239,8 @@ def analyze_all(
         "risk_reasons": risk_reasons,
         "horizon_scores": horizon_scores,
         "selected_horizon": selected_horizon,
+        "market_signal": market_signal,
+        "signal_confidence": signal_confidence,
         "horizon_notes": horizon_notes,
         "data_confidence": confidence,
         "confidence_notes": confidence_notes,
