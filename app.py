@@ -57,7 +57,7 @@ from factor_analysis import build_factor_analysis
 
 
 st.set_page_config(
-    page_title="个人投资者股票决策辅助 Agent V6.6",
+    page_title="个人投资者股票决策辅助 Agent V6.5",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -480,7 +480,7 @@ def load_current_user_data() -> None:
 
 def render_brand(subtitle: str = "") -> None:
     st.markdown('<div class="app-brand">Five-year evidence · Personal suitability</div>', unsafe_allow_html=True)
-    st.title("个人投资者股票决策辅助 Agent｜融合校准版 V6.6")
+    st.title("个人投资者股票决策辅助 Agent｜因子校准与信号分离版 V6.5")
     st.caption(subtitle or "近五年真实公开行情 · 最新公开资讯 · 历史相似状态检索 · 个人风险适配 · 教学研究原型")
 
 
@@ -1451,7 +1451,7 @@ def render_add_position_assessment(session: dict) -> None:
                 status.write("3/5 检索该股票最近公开资讯并核验来源")
                 news_payload = cached_stock_news(market, bundle.code, bundle.name, request_token)
 
-                status.write("4/5 使用V6.6融合校准模型计算方向可信度、个人适配、周期和风险预算")
+                status.write("4/5 使用V6.5校准模型计算方向可信度、个人适配、周期和风险预算")
                 analysis = analyze_all(bundle, profile, fundamental, macro)
                 selected_score = (analysis.get("selected_horizon") or {}).get("score")
                 analysis["news_analysis"] = assess_news(news_payload, selected_score)
@@ -1893,7 +1893,7 @@ def render_summary(bundle, analysis, profile) -> None:
         )
     elif not analog.get("available"):
         st.warning("本股在近五年窗口内没有形成达到最低要求的相似样本；请在相似周期页查看逐期限原因。")
-    st.caption("这里展示的是历史样本频率和情景分布，不是确定上涨概率，也不是收益承诺；V6.6相似周期不参与评分。")
+    st.caption("这里展示的是历史样本频率和情景分布，不是确定上涨概率，也不是收益承诺；V6.5相似周期不参与评分。")
 
     left, right = st.columns(2)
     with left:
@@ -1906,19 +1906,6 @@ def render_summary(bundle, analysis, profile) -> None:
                 f"历史验证：**{validation.get('status', '旧版未提供')}** · "
                 f"方向可信度 **{int(selected.get('signal_confidence') or 0)}/100**。"
             )
-            certification = dict(validation.get("cross_security_certification") or {})
-            if certification and not certification.get("certified"):
-                st.warning(
-                    "当前周期尚未通过跨股票样本外认证，因此这里只展示观察分，"
-                    "不把它解释为未来涨跌或买入方向。"
-                )
-            if validation.get("local_direction_hit_rate") is not None:
-                st.caption(
-                    f"当前相近分数历史样本{int(validation.get('local_band_count') or 0)}个；"
-                    f"与当前方向一致的占比{float(validation['local_direction_hit_rate']):.3%}，"
-                    f"符号调整后中位收益"
-                    f"{float(validation.get('local_signed_median_return') or 0.0):.3%}。"
-                )
             for note in analysis["horizon_notes"]:
                 st.caption(f"• {note}")
         else:
@@ -2564,7 +2551,7 @@ def render_factor_analysis(bundle, analysis, profile) -> None:
             column.caption("、".join(factors) if factors else "本次无")
 
     st.warning(
-        "本页单项建议只针对这只股票、当前所选持有期。V6.6不会根据一次结果重新拟合权重；"
+        "本页单项建议只针对这只股票、当前所选持有期。V6.5不会根据一次结果重新拟合权重；"
         "但会用预先固定的历史验证闸门将技术贡献保留、减半或归零。跨市场样本外验证仍是后续正式调参依据。"
     )
     for limitation in validation.get("limitations") or []:
@@ -2609,12 +2596,10 @@ def render_professional(bundle, analysis) -> None:
             - 行情方向与个人适配分开：用户适合承担风险，不代表股票未来一定上涨。
             - 价格相对均线和快慢均线已合并为一个趋势块，避免同一趋势信息重复加分。
             - 动量与相对强弱先按该股票近期正常波动调整；成交量只作量价背景，不再单独加分。
-            - 两个V6.5版本中的4个新候选因子都做了分离检验：20日短期均值回归只保留小权重研究值；52周位置、量价确认和波动率分位仅作背景。
-            - 每个持有期先用历史时点检验固定规则，再检查与当前分数最接近的历史区间。只能保留、减半或阻断信号，不会把失败信号反转；“有限通过”也不能形成可操作方向。
-            - 单只股票内部验证通过后，还必须通过多股票、跨阶段和两批独立留出样本认证。最终封闭检验尚无周期稳定通过，因此当前所有周期只展示观察分，不宣称未来方向。
+            - 每个持有期先用历史时点检验固定规则。验证通过保留技术贡献，有限通过减半，未通过归零并停止方向判断。
             - 持有期先按用户目标、资金期限和执行条件确定，不再从多个周期中挑选当前最高分。
             - 基本面只对中长期作有限修正；宏观最多修正正负2分。
-            - 相似周期继续展示收益分布，但不参与V6.6生产方向评分。
+            - 相似周期继续展示收益分布，但在完成跨标的样本外验证前不参与V6.5生产评分。
             - 仓位是风险预算参考值，不是收益承诺，也不等于下单指令。
             - 历史上涨样本占比不等于经过校准的真实上涨概率；所有数值由可检查的量化规则计算。
             """

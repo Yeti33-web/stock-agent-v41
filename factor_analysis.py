@@ -36,7 +36,7 @@ def _catalog_row(
 
 
 def factor_catalog() -> list[dict[str, str]]:
-    """Return the auditable factor dictionary used by V6.6.
+    """Return the auditable factor dictionary used by V6.5.
 
     The dictionary deliberately separates predictive factors from suitability,
     confidence and risk-control rules. A rule can affect the final decision even
@@ -102,13 +102,7 @@ def factor_catalog() -> list[dict[str, str]]:
             _catalog_row("持有期时点评分", "快慢均线结构", "与价格位置合并：两个信号同为正时趋势块+10，同为负时-10，否则0", "按周期设置的fast／slow窗口", "多头结构是趋势确认的一部分", "不再独立±8；与上一项共用±10分", "窗口不足则该周期不可用"),
             _catalog_row("持有期时点评分", "同周期动量", "clip(Rh÷(2×近60日波动×√h),-1,1)×8", "当前与h日前收盘价、近60日日收益波动", "正收益为正面，但需按股票正常波动调整", "原始最多±8分；再乘历史验证系数1／0.5／0", "收益或波动不可得时该周期不可用"),
             _catalog_row("持有期时点评分", "相对基准收益", "clip((R股票,h-R基准,h)÷(2×正常波动),-1,1)×7", "股票和对应基准同周期价格", "跑赢基准为正面", "原始最多±7分；再乘历史验证系数1／0.5／0", "基准缺失时0分并降低完整度"),
-            _catalog_row("持有期时点评分", "20日短期均值回归", "近10日收益相对自身近250日分布的z分数；z≥1扣分，z≤-1小幅加分", "至少120个交易日；只用于20日持有期", "极端追高偏负面，短期超跌小幅正面", "-5至+3分，再乘历史验证系数；其他周期0分", "样本不足或非20日周期时0分"),
             _catalog_row("持有期时点评分", "成交量比", "V20/V60仅结合价格方向解释，不直接计分", "近20日与60日平均成交量", "成交量本身没有固定涨跌方向", "0分；仅作量价背景", "成交量缺失时不展示确认信息"),
-            _catalog_row("持有期时点评分", "52周高点位置", "P/rolling_max(P,252)-1", "至少252个交易日", "只表示所处位置，不重复代替趋势分", "0分；仅展示", "数据不足时不展示"),
-            _catalog_row("持有期时点评分", "10日量价确认", "近10日涨跌与V10/V30组合为放量上涨、缩量上涨、放量下跌或中性", "至少30个交易日价格和成交量", "只作解释背景，因样本外表现不稳定不计分", "0分；仅展示", "价格或成交量缺失时不展示"),
-            _catalog_row("持有期时点评分", "波动率历史分位", "20日年化波动率在自身近250日中的分位", "至少120个交易日", "高分位提示不确定性高，不直接预测涨跌", "0分；进入风险解释", "数据不足时不展示"),
-            _catalog_row("持有期时点评分", "当前分数局部自校准", "在T日以前已知结果中，选取与当前原始分最接近的25%历史时点，计算同向命中率与符号调整后中位收益", "至少12个已完成的独立历史结果", "只能维持、减半或阻断方向信号，绝不反转失败信号", "通过×1并可形成方向；有限通过×0.5但只展示；未通过×0", "样本不足时不允许据此增强方向"),
-            _catalog_row("持有期时点评分", "跨股票样本外认证", "同一周期须在开发股票、较晚时段和至少两批不同股票留出样本中保持正向后才允许输出方向", "多股票、跨阶段且与调参样本分离的历史检验", "只控制能否给方向，不把测试答案写回当次分数", "已认证才可输出方向；未认证×0", "最终封闭检验尚无周期稳定通过；当前全部只展示评分"),
             _catalog_row("持有期时点评分", "宏观修正", "clip((宏观分-50)×0.08或0.10,-2,2)", "宏观评分", "宏观分高于50为正面", "最多±2分", "宏观分缺失时0分"),
             _catalog_row("持有期时点评分", "基本面修正", "短期0；60／120／250日分别乘0.06／0.10／0.12并截断", "基本面评分", "基本面分高于50为正面；仅用于中长期", "最多±4分", "基本面不可用时0分"),
             _catalog_row("持有期时点评分", "历史相似周期修正", "继续展示相似样本分布，但不进入生产评分", "可得相似历史样本", "只作情景说明，不代表未来方向", "0分", "样本不足时明确显示，不强行预测"),
@@ -286,7 +280,6 @@ def timing_contribution_rows(analysis: Mapping[str, Any]) -> list[dict[str, Any]
     benchmark_return = safe_float(selected.get("benchmark_return"))
     volume_ratio = safe_float(metrics.get("volume_ratio"))
     contributions = dict(selected.get("factor_contributions") or {})
-    context_factors = dict(selected.get("context_factors") or {})
     reliability = float(selected.get("technical_reliability_multiplier") or 0.0)
     validation = dict(selected.get("signal_validation") or {})
 
@@ -325,44 +318,12 @@ def timing_contribution_rows(analysis: Mapping[str, Any]) -> list[dict[str, Any]
                 "说明": f"相对基准收益按个股正常波动标准化；验证系数{reliability:.2f}",
             },
             {
-                "模块": "当前时点评分",
-                "因子": "20日短期均值回归",
-                "当前值": context_factors.get("ret10_zscore"),
-                "本次贡献": float(contributions.get("short_reversal") or 0.0),
-                "分值范围": "20日周期-5至+3分，其他周期0分；再乘历史验证系数",
-                "说明": "仅保留开发样本与未见A股样本方向一致的20日均值回归修正",
-            },
-            {
                 "模块": "量价背景",
                 "因子": "20日／60日成交量比",
                 "当前值": volume_ratio,
                 "本次贡献": 0.0,
                 "分值范围": "0分",
-                "说明": "成交量没有固定涨跌方向，V6.6仅作价格信号确认，不再独立加减分",
-            },
-            {
-                "模块": "状态背景",
-                "因子": "52周高点位置",
-                "当前值": context_factors.get("position_52_week"),
-                "本次贡献": 0.0,
-                "分值范围": "0分",
-                "说明": "与趋势因子高度重复且未见样本不稳定，只展示",
-            },
-            {
-                "模块": "量价背景",
-                "因子": "10日量价确认",
-                "当前值": context_factors.get("price_volume_confirmation"),
-                "本次贡献": 0.0,
-                "分值范围": "0分",
-                "说明": "样本外表现不稳定，只用于说明量价背景",
-            },
-            {
-                "模块": "风险背景",
-                "因子": "20日波动率历史分位",
-                "当前值": context_factors.get("volatility_percentile"),
-                "本次贡献": 0.0,
-                "分值范围": "0分",
-                "说明": "用于提示当前波动是否处于自身高位，不伪装成方向因子",
+                "说明": "成交量没有固定涨跌方向，V6.5仅作价格信号确认，不再独立加减分",
             },
             {
                 "模块": "当前时点评分",
@@ -386,7 +347,7 @@ def timing_contribution_rows(analysis: Mapping[str, Any]) -> list[dict[str, Any]
                 "当前值": selected.get("analog_status") or "未使用",
                 "本次贡献": 0.0,
                 "分值范围": "0分",
-                "说明": "V6.6保留情景展示，但不进入生产方向分",
+                "说明": "V6.5保留情景展示，但在跨标的样本外验证前移出生产评分",
             },
             {
                 "模块": "可靠性闸门",
@@ -394,15 +355,7 @@ def timing_contribution_rows(analysis: Mapping[str, Any]) -> list[dict[str, Any]
                 "当前值": f"{validation.get('status', '未验证')}；可信度{selected.get('signal_confidence', 0)}/100",
                 "本次贡献": 0.0,
                 "分值范围": "技术贡献乘1.0／0.5／0",
-                "说明": (
-                    str(validation.get("reason") or "历史验证不足时不形成方向判断")
-                    + (
-                        f"；当前相近分数{int(validation.get('local_band_count') or 0)}个，"
-                        f"同向命中{float(validation.get('local_direction_hit_rate')):.3%}"
-                        if validation.get("local_direction_hit_rate") is not None
-                        else "；当前相近分数样本不足"
-                    )
-                ),
+                "说明": str(validation.get("reason") or "历史验证不足时不形成方向判断"),
             },
         ]
     )
@@ -420,7 +373,6 @@ VALIDATION_FACTOR_META: dict[str, dict[str, str]] = {
     "trend_block": {"因子": "合并趋势结构", "当前权重": "原始±10分，受验证闸门控制"},
     "momentum": {"因子": "波动调整动量", "当前权重": "原始最多±8分，受验证闸门控制"},
     "relative_strength": {"因子": "波动调整相对强弱", "当前权重": "原始最多±7分，受验证闸门控制"},
-    "short_reversal": {"因子": "20日短期均值回归", "当前权重": "20日期-5至+3分；其他期限0分"},
     "volume_context": {"因子": "量价背景", "当前权重": "0分，仅展示"},
 }
 
@@ -498,7 +450,6 @@ def walk_forward_factor_validation(
     features["trend_block"] = technical["trend_points"] / 10.0
     features["momentum"] = technical["momentum_points"] / 8.0
     features["relative_strength"] = technical["relative_points"] / 7.0
-    features["short_reversal"] = technical["short_reversal_adjustment"] / 5.0
     features["volume_context"] = technical["volume_context"]
     target = technical["future_target"]
     stride = max(5, int(round(days / 4)))
@@ -531,10 +482,7 @@ def walk_forward_factor_validation(
         decision, reason = _validation_decision(samples, ic, hit_rate, spread, first_ic, second_ic)
         if key == "volume_context":
             decision = "降低权重"
-            reason = "成交量本身没有固定涨跌方向；V6.6生产权重固定为0，只保留量价背景展示。"
-        if key == "short_reversal" and days != 20:
-            decision = "降低权重"
-            reason = "开发样本只支持20日期限；当前期限生产权重为0。"
+            reason = "成交量本身没有固定涨跌方向；V6.5生产权重固定为0，只保留量价背景展示。"
         rows.append(
             {
                 "key": key,
@@ -587,28 +535,6 @@ def walk_forward_factor_validation(
             "依据": str(production_gate.get("reason") or "历史验证不足时不形成方向判断。"),
         }
     )
-    local_hit = safe_float(production_gate.get("local_direction_hit_rate"))
-    local_median = safe_float(production_gate.get("local_signed_median_return"))
-    rows.append(
-        {
-            "key": "local_score_calibration",
-            "因子": "当前分数局部自校准",
-            "当前权重": "只可降低或阻断方向，不反转信号",
-            "有效验证时点": int(production_gate.get("local_band_count") or 0),
-            "秩相关IC": None,
-            "方向命中率": local_hit,
-            "高低组收益差": local_median,
-            "前半段IC": None,
-            "后半段IC": None,
-            "建议": "候选删除" if production_gate.get("local_strongly_opposes") else "保留" if local_hit is not None and local_hit >= 0.52 and local_median is not None and local_median > 0 else "降低权重",
-            "依据": (
-                f"与当前原始分最接近的历史样本中，同向命中率{local_hit:.3%}，"
-                f"符号调整后中位收益{local_median:.3%}。"
-                if local_hit is not None and local_median is not None
-                else "当前相近分数的已完成历史样本不足，不允许据此增强信号。"
-            ),
-        }
-    )
 
     analog_backtest = dict((analysis.get("analog_forecast") or {}).get("backtest") or {})
     analog_cases = int(analog_backtest.get("cases") or 0)
@@ -626,7 +552,7 @@ def walk_forward_factor_validation(
                 "前半段IC": None,
                 "后半段IC": None,
                 "建议": "降低权重",
-                "依据": "单只股票的相似样本少且稳定性不足；V6.6不计入生产评分，继续作为情景说明。",
+                "依据": "单只股票的相似样本少且稳定性不足；V6.5已移出生产评分，继续作为情景说明。",
             }
         )
     else:
@@ -684,7 +610,7 @@ def build_factor_analysis(
         "historical_validation": walk_forward_factor_validation(bundle, analysis),
         "policy_note": (
             "风险承受、适配和仓位规则属于安全约束，不以短期收益预测结果决定删除；"
-            "历史验证主要评估能够用日线无前视还原的量价因子。V6.6固定采用通过=1、有限通过=0.5、"
-            "未通过=0的技术贡献闸门，并增加当前相近分数校准；相似周期和成交量不再独立计分。"
+            "历史验证主要评估能够用日线无前视还原的量价因子。V6.5固定采用通过=1、有限通过=0.5、"
+            "未通过=0的技术贡献闸门；相似周期和成交量不再独立计分。"
         ),
     }
