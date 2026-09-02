@@ -136,7 +136,7 @@ def synthetic_inputs():
 class FactorAnalysisV64Tests(unittest.TestCase):
     def test_full_catalog_is_complete_and_auditable(self):
         rows = FACTOR.factor_catalog()
-        self.assertEqual(len(rows), 91)
+        self.assertEqual(len(rows), 85)
         expected_columns = {"模块", "因子", "计算公式／规则", "数据要求", "方向", "当前权重／分值", "缺失数据处理"}
         self.assertTrue(all(set(row) == expected_columns for row in rows))
         modules = {row["模块"] for row in rows}

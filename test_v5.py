@@ -88,7 +88,7 @@ def test_five_year_fetch_window_and_short_history() -> None:
     assert calls[0][0] == expected_start
     assert bundle.requested_start == expected_start
     assert bundle.history_complete is False
-    assert any("数据不足，无法准确判断" in item for item in bundle.warnings)
+    assert any("下调可信度" in item for item in bundle.warnings)
 
 
 def test_hk_code_window_and_exchange_rate() -> None:

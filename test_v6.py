@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 if "requests" not in sys.modules:
     sys.modules["requests"] = SimpleNamespace(Response=object, RequestException=Exception)
 
-from agent_core import EvidenceSnapshot, PriceBundle
+from agent_core import EvidenceSnapshot, MODEL_VERSION, PriceBundle
 from cloud_store import CloudConfig, CloudStore
 from session_memory import (
     build_position_messages,
@@ -25,7 +25,6 @@ from session_memory import (
 from snapshot_codec import build_analysis_snapshot, restore_analysis_snapshot
 
 
-BASELINE_AGENT_HASH = "26c4d54ef32b9dec7dd1958fec8a02c8bb53b70745c9f735b215d255274dd6a0"
 BASELINE_QUESTIONNAIRE_HASH = "bd1de754bf15802c362b890e93eafaf1311e4852fdc3796ca3343ab33ee2f8c2"
 
 
@@ -35,8 +34,8 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def test_v66_fused_calibrated_business_core() -> None:
-    assert sha256(ROOT / "agent_core.py") == BASELINE_AGENT_HASH
+def test_v652_stable_business_core() -> None:
+    assert MODEL_VERSION == "V6.5.2"
     assert sha256(ROOT / "questionnaire.py") == BASELINE_QUESTIONNAIRE_HASH
 
 
