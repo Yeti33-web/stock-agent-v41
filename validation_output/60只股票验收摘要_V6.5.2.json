@@ -1,0 +1,20 @@
+{
+  "model_version": "V6.5.2",
+  "test_date": "2026-09-02",
+  "total": 60,
+  "insufficient_count": 0,
+  "insufficient_rate": 0.0,
+  "acceptance_threshold": 0.05,
+  "passed": true,
+  "markets": {
+    "A股": 20,
+    "港股": 20,
+    "美股": 20
+  },
+  "conclusions": {
+    "中性观察，等待确认": 45,
+    "可以小仓观察": 13,
+    "当前时点偏弱，暂缓": 2
+  },
+  "benchmark_errors": {}
+}
