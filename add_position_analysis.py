@@ -141,20 +141,14 @@ def evaluate_add_position(
     else:
         support_factors.append("用户风险承受能力覆盖该股票的模型风险等级。")
 
-    if not direction_available:
-        validation = dict(selected.get("signal_validation") or {})
-        hard_reasons.append(
-            f"所选持有期的历史验证{validation.get('status', '未通过')}，不能把当前评分解释为可靠的加仓信号。"
-        )
-        trigger_conditions.append("等待该持有期历史验证通过，或取得更可靠的数据后重新分析。")
-    elif timing_score_value is None:
+    if timing_score_value is None:
         hard_reasons.append("当前没有可用的持有周期评分，无法评价加仓时点。")
-    elif timing_score_value < 45:
+    elif timing_score_value < 42:
         hard_reasons.append(f"当前时点评分仅{timing_score_value:.0f}/100，尚未达到观察分界。")
-        trigger_conditions.append("等待所选周期评分恢复到45分以上，并重新检查趋势。")
-    elif timing_score_value < 60:
+        trigger_conditions.append("等待所选周期评分恢复到42分以上，并重新检查趋势。")
+    elif timing_score_value < 55:
         conditional_reasons.append(f"当前时点评分为{timing_score_value:.0f}/100，尚未达到中性偏积极分界。")
-        trigger_conditions.append("等待所选周期评分达到60分以上，或支持因素明显增强后重新评估。")
+        trigger_conditions.append("等待所选周期评分达到55分以上，或支持因素明显增强后重新评估。")
     else:
         support_factors.append(f"当前所选周期评分为{timing_score_value:.0f}/100，未处于偏弱区间。")
 

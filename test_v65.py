@@ -41,7 +41,7 @@ def synthetic_market(rows: int = 1_250) -> tuple[pd.DataFrame, pd.DataFrame]:
     return stock, benchmark
 
 
-class FactorCalibrationV66Tests(unittest.TestCase):
+class FactorCalibrationV65Tests(unittest.TestCase):
     def setUp(self) -> None:
         self.stock, self.benchmark = synthetic_market()
         self.metrics = agent_core.calculate_quant_metrics(self.stock, self.benchmark)
@@ -107,11 +107,13 @@ class FactorCalibrationV66Tests(unittest.TestCase):
         selected, _ = agent_core.choose_horizon(scores, profile)
         self.assertEqual(selected["name"], "1—3年")
 
-    def test_failed_validation_blocks_a_buy_direction(self):
+    def test_weak_validation_no_longer_erases_the_market_direction(self):
         selected = {
             "score": 90,
             "direction_available": False,
-            "signal_validation": {"status": "未通过"},
+            "label": "条件较积极",
+            "signal_confidence": 30,
+            "signal_validation": {"status": "参考性较弱"},
         }
         suitability = {"fit": "适配", "fit_reason": "风险等级覆盖"}
         conclusion, _ = agent_core.build_final_conclusion(
@@ -119,80 +121,45 @@ class FactorCalibrationV66Tests(unittest.TestCase):
             selected,
             {"upper_pct": 0.20},
         )
-        self.assertEqual(conclusion, "个人条件可讨论，但方向证据不足")
+        self.assertEqual(conclusion, "在风险预算内可分批关注")
 
-    def test_limited_validation_is_not_actionable(self):
-        scores = agent_core.score_horizons(
+    def test_missing_optional_evidence_does_not_block_price_analysis(self):
+        missing = agent_core.EvidenceSnapshot(False, "missing", score=None)
+        results = agent_core.score_horizons(
             self.metrics,
-            self.neutral,
-            self.neutral,
+            missing,
+            missing,
             None,
             None,
-            "A股个股",
         )
-        for item in scores:
-            if (item.get("signal_validation") or {}).get("status") == "有限通过":
-                self.assertFalse(item["direction_available"])
+        available = [item for item in results if item["available"]]
+        self.assertTrue(available)
+        self.assertTrue(all(item["direction_available"] for item in available))
+        self.assertTrue(all("不判断方向" not in item["label"] for item in available))
 
-    def test_short_reversal_is_bounded_and_only_used_for_20_days(self):
-        close = self.metrics["close"]
-        volume = self.metrics["volume"]
-        frame_20 = agent_core._technical_timing_frame(
-            close,
-            volume,
-            self.metrics["benchmark_close"],
-            next(item for item in agent_core.HORIZONS if item["days"] == 20),
+    def test_personal_mismatch_does_not_hide_the_stock_signal(self):
+        selected = {
+            "score": 70,
+            "label": "条件较积极",
+            "signal_confidence": 58,
+        }
+        conclusion, reason = agent_core.build_final_conclusion(
+            {"fit": "不适配", "fit_reason": "用户风险等级较低"},
+            selected,
+            {"upper_pct": 0.0},
         )
-        frame_60 = agent_core._technical_timing_frame(
-            close,
-            volume,
-            self.metrics["benchmark_close"],
-            next(item for item in agent_core.HORIZONS if item["days"] == 60),
-        )
-        self.assertGreaterEqual(float(frame_20["short_reversal_adjustment"].min()), -5.0)
-        self.assertLessEqual(float(frame_20["short_reversal_adjustment"].max()), 3.0)
-        self.assertTrue((frame_60["short_reversal_adjustment"] == 0.0).all())
+        self.assertIn("行情为条件较积极", conclusion)
+        self.assertIn("股票行情判断仍然有效", reason)
 
-    def test_local_calibration_can_only_keep_reduce_or_block(self):
-        close = self.metrics["close"]
-        volume = self.metrics["volume"]
-        frame = agent_core._technical_timing_frame(
-            close,
-            volume,
-            self.metrics["benchmark_close"],
-            next(item for item in agent_core.HORIZONS if item["days"] == 20),
-        )
-        validation = agent_core._validate_timing_signal(frame, 20)
-        self.assertIn(validation["reliability_multiplier"], {0.0, 0.5, 1.0})
-        self.assertIn(validation["status"], {"通过", "有限通过", "未通过"})
-        self.assertNotIn("反转", validation["reason"])
-
-    def test_catalog_documents_all_91_rules(self):
+    def test_catalog_still_documents_all_85_rules(self):
         rows = factor_analysis.factor_catalog()
-        self.assertEqual(len(rows), 91)
+        self.assertEqual(len(rows), 85)
         volume_row = next(
             item
             for item in rows
             if item["模块"] == "持有期时点评分" and item["因子"] == "成交量比"
         )
         self.assertEqual(volume_row["当前权重／分值"], "0分；仅作量价背景")
-        factor_names = {item["因子"] for item in rows}
-        self.assertTrue(
-            {
-                "20日短期均值回归",
-                "52周高点位置",
-                "10日量价确认",
-                "波动率历史分位",
-                "当前分数局部自校准",
-                "跨股票样本外认证",
-            }.issubset(factor_names)
-        )
-
-    def test_no_horizon_is_certified_after_final_sealed_audit(self):
-        self.assertFalse(agent_core.direction_certification("A股个股", 5)["certified"])
-        self.assertFalse(agent_core.direction_certification("美股个股", 5)["certified"])
-        self.assertFalse(agent_core.direction_certification("A股个股", 20)["certified"])
-        self.assertFalse(agent_core.direction_certification("港股个股", 5)["certified"])
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from add_position_analysis import (
 
 from agent_core import (
     EvidenceSnapshot,
+    MODEL_VERSION,
     analyze_all,
     analyze_sell_signals,
     calculate_amount_holding_values,
@@ -54,10 +55,11 @@ from session_memory import (
 from snapshot_codec import build_analysis_snapshot, restore_analysis_snapshot
 from news_analysis import assess_news, fetch_stock_news
 from factor_analysis import build_factor_analysis
+from historical_decision import build_v7_decision
 
 
 st.set_page_config(
-    page_title="个人投资者股票决策辅助 Agent V6.5",
+    page_title=f"个人投资者股票决策辅助 Agent {MODEL_VERSION}",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -115,16 +117,32 @@ def cached_price_bundle(market: str, code: str, request_token: int):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_fundamentals(market: str, code: str, last_price: float, asset_type: str) -> EvidenceSnapshot:
-    if market == "A股":
-        return fetch_a_fundamentals(code, last_price, asset_type)
-    if market == "美股":
-        return fetch_us_fundamentals(code, last_price)
-    return fetch_hk_fundamentals(code, last_price)
+    try:
+        if market == "A股":
+            return fetch_a_fundamentals(code, last_price, asset_type)
+        if market == "美股":
+            return fetch_us_fundamentals(code, last_price)
+        return fetch_hk_fundamentals(code, last_price)
+    except Exception as exc:
+        return EvidenceSnapshot(
+            False,
+            "财务数据降级模式",
+            notes=[f"财务通道暂不可用：{type(exc).__name__}；本项跳过，量价判断继续。"],
+        )
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_macro(market: str, benchmark: pd.DataFrame) -> EvidenceSnapshot:
-    return fetch_macro_snapshot(market, benchmark)
+    try:
+        return fetch_macro_snapshot(market, benchmark)
+    except Exception as exc:
+        return EvidenceSnapshot(
+            True,
+            "宏观中性降级模式",
+            fields={"市场状态": "外部宏观接口暂不可用"},
+            score=50.0,
+            notes=[f"宏观通道暂不可用：{type(exc).__name__}；按中性0分修正，个股判断继续。"],
+        )
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -140,7 +158,20 @@ def cached_hkd_cny_rate() -> dict:
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_stock_news(market: str, code: str, name: str, request_token: int) -> dict:
     del request_token
-    return fetch_stock_news(market, code, name)
+    try:
+        return fetch_stock_news(market, code, name)
+    except Exception as exc:
+        return {
+            "version": 1,
+            "market": market,
+            "code": code,
+            "name": name,
+            "window_days": 30,
+            "providers_attempted": [],
+            "providers_used": [],
+            "items": [],
+            "warnings": [f"资讯通道暂不可用：{type(exc).__name__}；资讯因子跳过，行情判断继续。"],
+        }
 
 
 def initialize_v5_state() -> None:
@@ -480,7 +511,7 @@ def load_current_user_data() -> None:
 
 def render_brand(subtitle: str = "") -> None:
     st.markdown('<div class="app-brand">Five-year evidence · Personal suitability</div>', unsafe_allow_html=True)
-    st.title("个人投资者股票决策辅助 Agent｜因子校准与信号分离版 V6.5")
+    st.title(f"个人投资者股票决策辅助 Agent｜数据渠道稳定版 {MODEL_VERSION}")
     st.caption(subtitle or "近五年真实公开行情 · 最新公开资讯 · 历史相似状态检索 · 个人风险适配 · 教学研究原型")
 
 
@@ -964,7 +995,7 @@ def render_saved_analysis(session: dict) -> None:
     )
     st.caption(f"当次行情来源：{bundle.provider}；这是已保存的历史快照，不会用今天的数据改写。")
     if not bundle.history_complete:
-        st.warning("该次分析可得历史不足五年。数据不足，无法准确判断，结果仅作低置信度参考。")
+        st.warning("该次分析可得历史不足五年，已降低可信度；只要所选周期窗口足够，系统仍会继续判断。")
 
     previous_holding_state = st.session_state.get("confirmed_holding_state", "尚未持有")
     previous_holding_method = st.session_state.get("confirmed_holding_method", "按持股数量填写")
@@ -980,7 +1011,7 @@ def render_saved_analysis(session: dict) -> None:
         tab_names = ["结论"]
         if holding_state == "已经持有":
             tab_names.append("卖出信号")
-        tab_names.extend(["相似周期预测", "最新资讯", "风险与仓位", "持有周期", "因子解释与验证", "数据证据"])
+        tab_names.extend(["历史情景决策", "相似周期预测", "最新资讯", "风险与仓位", "持有周期", "因子解释与验证", "数据证据"])
         if view_mode == "专业模式":
             tab_names.append("专业指标")
         tabs = st.tabs(tab_names)
@@ -990,6 +1021,8 @@ def render_saved_analysis(session: dict) -> None:
         if "卖出信号" in tab_map:
             with tab_map["卖出信号"]:
                 render_sell_signals(bundle, analysis, profile)
+        with tab_map["历史情景决策"]:
+            render_historical_decision(bundle, analysis)
         with tab_map["相似周期预测"]:
             render_analog_forecast(analysis)
         with tab_map["最新资讯"]:
@@ -1293,7 +1326,7 @@ def render_add_position_assessment_result(assessment: dict) -> None:
         f"{assessment.get('price_unit') or ''}；来源：{assessment.get('provider') or '公开行情接口'}。"
     )
     if not bool(assessment.get("history_complete")):
-        st.warning("该股票可得历史不足五年。数据不足，无法准确判断，本次加仓结论仅作低置信度参考。")
+        st.warning("该股票可得历史不足五年，已降低可信度；本次加仓仍按实际可得行情分析。")
     st.info("本次仅保存加仓适配分析，没有改变真实持仓。只有实际成交后在“首次买入／加仓”中登记，才会更新本金、股数和组合占比。")
 
 
@@ -1451,7 +1484,7 @@ def render_add_position_assessment(session: dict) -> None:
                 status.write("3/5 检索该股票最近公开资讯并核验来源")
                 news_payload = cached_stock_news(market, bundle.code, bundle.name, request_token)
 
-                status.write("4/5 使用V6.5校准模型计算方向可信度、个人适配、周期和风险预算")
+                status.write(f"4/5 使用{MODEL_VERSION}稳定模型计算行情方向、个人适配、周期和风险预算")
                 analysis = analyze_all(bundle, profile, fundamental, macro)
                 selected_score = (analysis.get("selected_horizon") or {}).get("score")
                 analysis["news_analysis"] = assess_news(news_payload, selected_score)
@@ -2201,8 +2234,8 @@ def render_horizons(analysis) -> None:
     if available:
         colors = ["#2563eb" if item["name"] == selected_name else "#94a3b8" for item in available]
         fig = go.Figure(go.Bar(x=[item["name"] for item in available], y=[item["score"] for item in available], marker_color=colors))
-        fig.add_hline(y=45, line_dash="dot", annotation_text="偏弱/观察分界")
-        fig.add_hline(y=60, line_dash="dot", annotation_text="中性偏积极分界")
+        fig.add_hline(y=42, line_dash="dot", annotation_text="偏弱/观察分界")
+        fig.add_hline(y=55, line_dash="dot", annotation_text="中性偏积极分界")
         fig.update_layout(height=360, yaxis_range=[0, 100], yaxis_title="当前时点评分", margin=dict(l=20, r=20, t=20, b=20))
         st.plotly_chart(fig, width="stretch")
     st.warning("1个交易日需要分钟级或实时行情、交易成本与盘口信息。本版只有公开日线，因此会显示该周期但不会假装给出可靠次日预测。")
@@ -2415,6 +2448,169 @@ def render_evidence(bundle, analysis) -> None:
     st.info("宏观环境只作为修正因素。短期个股波动不能仅靠宏观数据预测，长期判断仍需结合公司基本面和估值。")
 
 
+def render_historical_decision(bundle, analysis) -> None:
+    """Render the V7.0.0 historical-scenario decision layer.
+
+    Old snapshots do not contain ``historical_decision``; they are recomputed
+    from the saved bundle at render time (never using data after the snapshot).
+    """
+
+    decision = analysis.get("historical_decision")
+    if not isinstance(decision, dict):
+        try:
+            decision = build_v7_decision(bundle, analysis, news_result=analysis.get("news_analysis"))
+        except Exception as exc:
+            decision = {"available": False, "reason": f"决策层生成失败：{type(exc).__name__}: {exc}"}
+
+    if not decision.get("available"):
+        st.info(f"历史情景决策层不可用：{decision.get('reason', '数据不足')}")
+        return
+
+    st.subheader(f"历史相似情景综合决策（决策引擎 {decision.get('engine_version', 'V7.0.0')}）")
+    st.caption(
+        "该决策层在原有V6.5.2评分之上独立运行：历史证据高质量时权重≥50%且为最大模块；"
+        "证据不足时自动降级，历史权重不超过20%。所有数学计算由程序完成。"
+    )
+
+    weights = dict(decision.get("weights") or {})
+    weights_pct = dict(weights.get("weights_pct") or {})
+    evidence = dict(decision.get("evidence") or {})
+    cols = st.columns(5)
+    cols[0].metric("综合评分", f"{float(decision.get('composite_score') or 0):.1f}/100")
+    cols[1].metric("最终判断", str(decision.get("recommendation", "—")))
+    cols[2].metric("置信度", f"{float(decision.get('confidence') or 0):.0f}/100")
+    cols[3].metric("历史证据等级", str(evidence.get("level", "LOW")))
+    cols[4].metric("历史模块权重", f"{weights_pct.get('historical', 0):.1f}%")
+    st.caption(str(decision.get("recommendation_reason", "")))
+
+    module_names = dict(decision.get("module_names") or {})
+    module_scores = dict(decision.get("module_scores") or {})
+    modules_available = dict(decision.get("modules_available") or {})
+    weight_rows = []
+    for key, name in module_names.items():
+        score = module_scores.get(key)
+        weight_rows.append(
+            [
+                name,
+                f"{weights_pct.get(key, 0):.1f}%",
+                f"{score:.1f}/100" if score is not None else "不可用",
+                "可用" if modules_available.get(key) else "不可用",
+            ]
+        )
+    st.markdown("#### 动态权重与模块得分")
+    st.dataframe(pd.DataFrame(weight_rows, columns=["模块", "实际权重", "模块方向分", "状态"]), hide_index=True, width="stretch")
+    st.caption("；".join(weights.get("reasons", [])))
+    veto = dict(decision.get("veto") or {})
+    for reason in veto.get("reasons", []):
+        st.warning(f"交叉验证降权：{reason}")
+
+    historical = dict(decision.get("historical") or {})
+    st.markdown("#### 历史相似情景（先选择，后观察结果）")
+    if historical.get("available"):
+        st.caption(
+            f"样本{historical.get('sample_count', 0)}个（{historical.get('selection_mode', '')}，"
+            f"阈值{historical.get('selection_threshold', 0):.0f}分），"
+            f"平均相似度{evidence.get('similarity_score', 0):.3f}分，"
+            f"可信度{evidence.get('reliability_score', 0):.3f}，数据质量{evidence.get('data_quality_score', 0):.3f}。"
+        )
+        horizon_rows = []
+        for item in historical.get("horizons", []):
+            if not item.get("available"):
+                horizon_rows.append([f"{item.get('days')}日", "样本不足", "—", "—", "—", "—", "—"])
+                continue
+            horizon_rows.append(
+                [
+                    f"{item.get('days')}日",
+                    f"{item.get('sample_count', 0)}",
+                    f"{item.get('mean_return', 0):+.3%}",
+                    f"{item.get('win_rate', 0):.1%}",
+                    f"{item.get('median_max_gain', 0):+.3%}",
+                    f"{item.get('median_max_drawdown', 0):+.3%}",
+                    str(item.get("dominant_pattern", "")),
+                ]
+            )
+        st.dataframe(
+            pd.DataFrame(horizon_rows, columns=["期限", "样本", "平均收益", "上涨频率", "最大涨幅(中位)", "最大回撤(中位)", "主要路径"]),
+            hide_index=True,
+            width="stretch",
+        )
+        for line in (historical.get("path_report") or []):
+            st.caption(f"• {line}")
+        st.caption(historical.get("guard", ""))
+    else:
+        st.info(str(historical.get("reason", "没有可用历史案例。")))
+    for note in historical.get("notes", []):
+        st.caption(f"• {note}")
+    unavailable_dims = evidence.get("unavailable_dimensions") or []
+    if unavailable_dims:
+        st.caption(
+            "以下情景维度历史数据暂不可用（不回填、不伪造，已计入数据质量）："
+            + "；".join(f"{item.get('name')}：{item.get('reason')}" for item in unavailable_dims)
+        )
+
+    event = dict(decision.get("event_reaction") or {})
+    st.markdown("#### 最新资讯与事件—市场反应")
+    if event.get("available"):
+        event_rows = []
+        for item in event.get("events", []):
+            if "reaction" not in item:
+                continue
+            event_rows.append(
+                [
+                    str(item.get("title", ""))[:40],
+                    str(item.get("sentiment", "")),
+                    str(item.get("event_date", "")),
+                    f"{item.get('day0_return', 0):+.3%}" if item.get("day0_return") is not None else "—",
+                    str(item.get("reaction", "")),
+                ]
+            )
+        if event_rows:
+            st.dataframe(
+                pd.DataFrame(event_rows, columns=["事件", "性质", "反应日", "当日涨跌", "市场反应判定"]),
+                hide_index=True,
+                width="stretch",
+            )
+        for flag in event.get("expectation_flags", []):
+            st.caption(f"• {flag}")
+        st.caption(event.get("method_note", ""))
+    else:
+        st.info(str(event.get("reason", "没有可观察价格反应的资讯。")))
+
+    technical = dict(decision.get("technical_patterns") or {})
+    st.markdown("#### 当前行情与技术形态")
+    if technical.get("available"):
+        soldiers = dict(technical.get("three_white_soldiers") or {})
+        if soldiers.get("detected"):
+            st.caption(
+                f"红三兵判定：{soldiers.get('interpretation', '')}，"
+                f"有效性{soldiers.get('validity_score', 0):.1f}/100。"
+            )
+            for check in soldiers.get("checks", []):
+                st.caption(f"• {check}")
+        else:
+            st.caption(f"红三兵：{soldiers.get('reason', '未出现')}")
+        for reason in technical.get("reasons", []):
+            st.caption(f"• {reason}")
+    else:
+        st.info(str(technical.get("reason", "技术形态不可用。")))
+
+    legacy = dict(decision.get("legacy_factor") or {})
+    st.markdown("#### 原有因子交叉验证")
+    st.caption(
+        f"原V6.5.2时点评分：{legacy.get('score', '—')}/100（{legacy.get('horizon_name', '—')}）；"
+        f"基本面：{legacy.get('fundamental_score', '暂不可用')}；宏观市场：{legacy.get('macro_score', '暂不可用')}。"
+    )
+    st.caption(f"交叉验证：{legacy.get('cross_check', '')}")
+
+    narrative = dict(decision.get("narrative") or {})
+    st.markdown("#### 最终推演（为什么）")
+    chain = narrative.get("最终推演")
+    if chain:
+        for line in str(chain).split("\n"):
+            st.markdown(line)
+    st.caption("本结果仅供研究参考，不构成投资建议；历史相似不代表未来重复。")
+
+
 def render_factor_analysis(bundle, analysis, profile) -> None:
     """Show factor-level attribution and no-look-ahead historical checks.
 
@@ -2551,8 +2747,8 @@ def render_factor_analysis(bundle, analysis, profile) -> None:
             column.caption("、".join(factors) if factors else "本次无")
 
     st.warning(
-        "本页单项建议只针对这只股票、当前所选持有期。V6.5不会根据一次结果重新拟合权重；"
-        "但会用预先固定的历史验证闸门将技术贡献保留、减半或归零。跨市场样本外验证仍是后续正式调参依据。"
+        f"本页单项建议只针对这只股票、当前所选持有期。{MODEL_VERSION}不会根据一次结果重新拟合权重；"
+        "历史验证仅用于降低技术因子影响和可信度，不再把全部技术贡献归零，也不再阻断行情判断。"
     )
     for limitation in validation.get("limitations") or []:
         st.caption(f"• {limitation}")
@@ -2596,10 +2792,10 @@ def render_professional(bundle, analysis) -> None:
             - 行情方向与个人适配分开：用户适合承担风险，不代表股票未来一定上涨。
             - 价格相对均线和快慢均线已合并为一个趋势块，避免同一趋势信息重复加分。
             - 动量与相对强弱先按该股票近期正常波动调整；成交量只作量价背景，不再单独加分。
-            - 每个持有期先用历史时点检验固定规则。验证通过保留技术贡献，有限通过减半，未通过归零并停止方向判断。
+            - 每个持有期都用历史时点检验固定规则；验证较弱时降低技术贡献和可信度，但不把正常行情结论全部归零。
             - 持有期先按用户目标、资金期限和执行条件确定，不再从多个周期中挑选当前最高分。
             - 基本面只对中长期作有限修正；宏观最多修正正负2分。
-            - 相似周期继续展示收益分布，但在完成跨标的样本外验证前不参与V6.5生产评分。
+            - 相似周期继续展示收益分布，但在完成跨标的样本外验证前不参与V6.5.2生产评分。
             - 仓位是风险预算参考值，不是收益承诺，也不等于下单指令。
             - 历史上涨样本占比不等于经过校准的真实上涨概率；所有数值由可检查的量化规则计算。
             """
@@ -2672,7 +2868,29 @@ def page_three() -> None:
             analysis = analyze_all(bundle, profile, fundamental, macro)
             selected_score = (analysis.get("selected_horizon") or {}).get("score")
             analysis["news_analysis"] = assess_news(news_payload, selected_score)
-            analysis["factor_analysis"] = build_factor_analysis(bundle, analysis, profile)
+            try:
+                analysis["historical_decision"] = build_v7_decision(
+                    bundle, analysis, news_result=analysis["news_analysis"]
+                )
+            except Exception as decision_exc:
+                analysis["historical_decision"] = {
+                    "available": False,
+                    "engine_version": "V7.0.0",
+                    "reason": f"决策层属于新增展示模块，本次生成失败：{type(decision_exc).__name__}，不影响原有结论。",
+                }
+            try:
+                analysis["factor_analysis"] = build_factor_analysis(bundle, analysis, profile)
+            except Exception as factor_exc:
+                analysis["factor_analysis"] = {
+                    "catalog": [],
+                    "contributions": {},
+                    "historical_validation": {
+                        "summary": "因子解释页暂时生成失败，但核心行情、风险和结论已经正常完成。",
+                        "rows": [],
+                        "limitations": [f"解释模块错误：{type(factor_exc).__name__}"],
+                    },
+                    "policy_note": "解释模块属于附加展示，不参与核心判断。",
+                }
             current_holding = float(profile.get("current_holding_value") or 0.0)
             assets = float(profile.get("investable_assets") or 0.0)
             analysis["position"]["current_amount"] = current_holding
@@ -2694,11 +2912,12 @@ def page_three() -> None:
             st.session_state.profile = profile
             status.update(label="分析完成", state="complete", expanded=False)
         except Exception as exc:
-            status.update(label="真实数据获取或分析失败", state="error", expanded=True)
-            st.error("Agent没有取得足够的真实公开数据，因此没有生成一个看似精确但不可靠的结果。")
-            st.code(str(exc))
+            status.update(label="本次分析没有完成", state="error", expanded=True)
+            st.error("这不是“证据不足”的投资结论，而是数据通道或程序运行失败。")
+            st.code(f"{type(exc).__name__}: {exc}")
             st.markdown(
-                "请先确认代码正确和网络可用，然后在项目文件夹运行：\n\n"
+                f"当前页面版本应为 `{MODEL_VERSION}`。请先确认GitHub根目录中的 `app.py` 和 `agent_core.py` 都来自同一个压缩包，"
+                "再确认网络可用。也可以在项目文件夹运行：\n\n"
                 "`python -m pip install --upgrade -r requirements.txt`\n\n"
                 "再运行 `python 测试真实行情接口.py`。如果测试仍失败，把黑色窗口的完整截图发给我。"
             )
@@ -2762,7 +2981,7 @@ def page_three() -> None:
     st.success(f"{bundle.code}｜{bundle.name}｜{bundle.asset_type}｜分析区间 {full_first} 至 {full_last}，共 {len(bundle.stock)} 个交易日。")
     st.caption(f"行情来源：{bundle.provider}；基准：{bundle.benchmark_name}；数据以最近公开返回为准，可能延迟、缺失或调整。")
     if not bundle.history_complete:
-        st.warning("该股票可得历史不足五年。数据不足，无法准确判断，分析结果仅作低置信度参考。")
+        st.warning("该股票可得历史不足五年，已降低可信度；只要所选周期窗口足够，系统仍会继续判断。")
     for warning in bundle.warnings:
         if "不足五年" not in warning:
             st.info(warning)
@@ -2771,7 +2990,7 @@ def page_three() -> None:
     tab_names = ["结论"]
     if st.session_state.confirmed_holding_state == "已经持有":
         tab_names.append("卖出信号")
-    tab_names.extend(["相似周期预测", "最新资讯", "风险与仓位", "持有周期", "因子解释与验证", "数据证据"])
+    tab_names.extend(["历史情景决策", "相似周期预测", "最新资讯", "风险与仓位", "持有周期", "因子解释与验证", "数据证据"])
     if view_mode == "专业模式":
         tab_names.append("专业指标")
     tabs = st.tabs(tab_names)
@@ -2781,6 +3000,8 @@ def page_three() -> None:
     if "卖出信号" in tab_map:
         with tab_map["卖出信号"]:
             render_sell_signals(bundle, analysis, profile)
+    with tab_map["历史情景决策"]:
+        render_historical_decision(bundle, analysis)
     with tab_map["相似周期预测"]:
         render_analog_forecast(analysis)
     with tab_map["最新资讯"]:

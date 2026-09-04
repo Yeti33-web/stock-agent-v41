@@ -28,6 +28,7 @@ except ImportError:
 
 
 HISTORY_YEARS = 5
+MODEL_VERSION = "V6.5.2"
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 StockResearchAgent/5.7"}
 SEC_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "IndividualInvestorResearchAgent/5.7 educational-use")}
 
@@ -180,6 +181,12 @@ def ratio_fraction(value: Any) -> float | None:
     if abs(number) > 5:
         return number / 100
     return number
+
+
+def percent_fraction(value: Any) -> float | None:
+    """Convert a field whose upstream definition is explicitly percentage."""
+    number = safe_float(value)
+    return number / 100 if number is not None else None
 
 
 def calculate_holding_values(
@@ -445,17 +452,27 @@ def _get_with_retry(url: str, *, params: dict[str, Any] | None = None, timeout: 
 def fetch_yahoo_chart_history(symbol: str, start_text: str, end_text: str) -> tuple[pd.DataFrame, str]:
     period1 = int(pd.Timestamp(start_text, tz="UTC").timestamp())
     period2 = int((pd.Timestamp(end_text, tz="UTC") + pd.Timedelta(days=1)).timestamp())
-    response = _get_with_retry(
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
-        params={
-            "period1": period1,
-            "period2": period2,
-            "interval": "1d",
-            "events": "history",
-            "includeAdjustedClose": "true",
-        },
-        timeout=20,
-    )
+    params = {
+        "period1": period1,
+        "period2": period2,
+        "interval": "1d",
+        "events": "history",
+        "includeAdjustedClose": "true",
+    }
+    response: requests.Response | None = None
+    errors: list[str] = []
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        try:
+            response = _get_with_retry(
+                f"https://{host}/v8/finance/chart/{symbol}",
+                params=params,
+                timeout=12,
+            )
+            break
+        except Exception as exc:
+            errors.append(f"{host}: {exc}")
+    if response is None:
+        raise RuntimeError("Yahoo两个公开图表节点均失败。" + "；".join(errors))
     payload = response.json().get("chart", {})
     if payload.get("error"):
         raise RuntimeError(str(payload["error"]))
@@ -720,6 +737,19 @@ def fetch_hk_security(code: str, start_text: str, end_text: str) -> tuple[pd.Dat
     errors: list[str] = []
     resolved_name = normalized
 
+    # The chart endpoint is normally the fastest cross-market route.  Try it
+    # first, then fall back to independent Chinese-market routes if needed.
+    try:
+        data, yahoo_name = fetch_yahoo_chart_history(yahoo_symbol, start_text, end_text)
+        if not data.empty:
+            resolved_name = yahoo_name or normalized
+            candidate = (data, resolved_name, f"Yahoo Finance港股图表公开接口（{yahoo_symbol}，复权日线）")
+            candidates.append(candidate)
+            if len(data) >= 120 and (pd.Timestamp(date.today()) - data["日期"].max()).days <= 10:
+                return candidate
+    except Exception as exc:
+        errors.append(f"Yahoo图表接口：{exc}")
+
     if ak is not None:
         try:
             raw = ak.stock_hk_hist(
@@ -734,14 +764,6 @@ def fetch_hk_security(code: str, start_text: str, end_text: str) -> tuple[pd.Dat
                 candidates.append((data, normalized, "AKShare／东方财富港股公开行情（前复权日线）"))
         except Exception as exc:
             errors.append(f"AKShare／东方财富：{exc}")
-
-    try:
-        data, yahoo_name = fetch_yahoo_chart_history(yahoo_symbol, start_text, end_text)
-        if not data.empty:
-            resolved_name = yahoo_name or normalized
-            candidates.append((data, resolved_name, f"Yahoo Finance港股图表公开接口（{yahoo_symbol}，复权日线）"))
-    except Exception as exc:
-        errors.append(f"Yahoo图表接口：{exc}")
 
     try:
         data = fetch_yfinance_history(yahoo_symbol, start_text, end_text)
@@ -778,6 +800,16 @@ def fetch_a_security(code: str, start_text: str, end_text: str) -> tuple[pd.Data
     normalized = normalize_a_code(code)
     candidates: list[tuple[pd.DataFrame, str, str]] = []
     errors: list[str] = []
+    yahoo_symbol = a_share_yahoo_ticker(normalized)
+    try:
+        data, yahoo_name = fetch_yahoo_chart_history(yahoo_symbol, start_text, end_text)
+        if not data.empty:
+            candidate = (data, yahoo_name or normalized, f"Yahoo Finance图表公开行情（{yahoo_symbol}）")
+            candidates.append(candidate)
+            if len(data) >= 120 and (pd.Timestamp(date.today()) - data["日期"].max()).days <= 10:
+                return candidate
+    except Exception as exc:
+        errors.append(f"Yahoo图表接口：{exc}")
     if is_exchange_traded_fund_code(normalized):
         try:
             data = _fetch_sina_fund(normalized, start_text, end_text)
@@ -817,16 +849,6 @@ def fetch_a_security(code: str, start_text: str, end_text: str) -> tuple[pd.Data
         except Exception as exc:
             errors.append(f"AKShare／东方财富：{exc}")
     try:
-        yahoo_symbol = a_share_yahoo_ticker(normalized)
-        data, yahoo_name = fetch_yahoo_chart_history(yahoo_symbol, start_text, end_text)
-        if not data.empty:
-            candidates.append((data, yahoo_name or normalized, f"Yahoo Finance图表备用行情（{yahoo_symbol}）"))
-            if len(data) >= 500 and (pd.Timestamp(date.today()) - data["日期"].max()).days <= 10:
-                return candidates[-1]
-    except Exception as exc:
-        errors.append(f"Yahoo图表备用：{exc}")
-    try:
-        yahoo_symbol = a_share_yahoo_ticker(normalized)
         data = fetch_yfinance_history(yahoo_symbol, start_text, end_text)
         if not data.empty:
             candidates.append((data, normalized, f"yfinance备用行情（{yahoo_symbol}）"))
@@ -840,6 +862,12 @@ def fetch_a_security(code: str, start_text: str, end_text: str) -> tuple[pd.Data
 
 def fetch_a_benchmark(start_text: str, end_text: str) -> pd.DataFrame:
     errors: list[str] = []
+    try:
+        data, _ = fetch_yahoo_chart_history("000300.SS", start_text, end_text)
+        if not data.empty:
+            return data
+    except Exception as exc:
+        errors.append(str(exc))
     try:
         data = fetch_baostock_history("sh.000300", start_text, end_text, adjustflag="3")
         if not data.empty:
@@ -859,12 +887,6 @@ def fetch_a_benchmark(start_text: str, end_text: str) -> pd.DataFrame:
                 return data
         except Exception as exc:
             errors.append(str(exc))
-    try:
-        data, _ = fetch_yahoo_chart_history("000300.SS", start_text, end_text)
-        if not data.empty:
-            return data
-    except Exception as exc:
-        errors.append(str(exc))
     try:
         data = fetch_yfinance_history("000300.SS", start_text, end_text)
         if not data.empty:
@@ -1043,66 +1065,207 @@ def _score_fundamentals(fields: dict[str, Any]) -> tuple[float | None, list[str]
     return float(np.clip(score, 0, 100)), positives, risks
 
 
+def _latest_public_financial_row(frame: pd.DataFrame, date_columns: tuple[str, ...]) -> dict[str, Any]:
+    """Return the latest row that was publicly available by the model date."""
+    if frame is None or frame.empty:
+        return {}
+    cutoff = pd.Timestamp(date.today())
+    saw_date_column = False
+    for column in date_columns:
+        if column not in frame.columns:
+            continue
+        saw_date_column = True
+        prepared = frame.copy()
+        prepared[column] = pd.to_datetime(prepared[column], errors="coerce")
+        prepared = prepared.dropna(subset=[column])
+        prepared = prepared[prepared[column] <= cutoff]
+        if not prepared.empty:
+            return prepared.sort_values(column).iloc[-1].to_dict()
+    # If the provider supplied disclosure dates but all rows are after the
+    # analysis date, returning row zero would leak future information.
+    return {} if saw_date_column else frame.iloc[0].to_dict()
+
+
+def fetch_a_fundamentals_eastmoney(code: str, last_price: float | None) -> EvidenceSnapshot:
+    if ak is None:
+        return EvidenceSnapshot(False, "AKShare未安装", notes=["东方财富财务备用通道不可用。"])
+    normalized = normalize_a_code(code)
+    symbol = f"{normalized}.{a_share_exchange(normalized).upper()}"
+    raw = ak.stock_financial_analysis_indicator_em(symbol=symbol, indicator="按报告期")
+    row = _latest_public_financial_row(raw, ("NOTICE_DATE", "REPORT_DATE", "UPDATE_DATE"))
+    if not row:
+        return EvidenceSnapshot(False, "东方财富财务指标", notes=["财务备用通道没有返回公开报告。"])
+    eps = safe_float(row.get("EPSJB"))
+    cash_per_share = safe_float(row.get("MGJYXJJE"))
+    cash_quality = cash_per_share / eps if cash_per_share is not None and eps not in {None, 0} else None
+    fields = {
+        "公司名称": row.get("SECURITY_NAME_ABBR") or normalized,
+        "行业": "未取得",
+        "报告期": str(row.get("REPORT_DATE_NAME") or row.get("REPORT_DATE") or "最近公开报告"),
+        "实际披露日期": str(row.get("NOTICE_DATE") or row.get("UPDATE_DATE") or "未取得"),
+        "净资产收益率": percent_fraction(row.get("ROEJQ")),
+        "净利率": percent_fraction(row.get("XSJLL")),
+        "净利润同比": percent_fraction(row.get("PARENTNETPROFITTZ")),
+        "营收同比": percent_fraction(row.get("TOTALOPERATEREVETZ")),
+        "资产负债率": percent_fraction(row.get("ZCFZL")),
+        "经营现金流／净利润": cash_quality,
+        "市盈率TTM": None,
+    }
+    score, positives, risks = _score_fundamentals(fields)
+    return EvidenceSnapshot(
+        score is not None,
+        "AKShare／东方财富A股公开财务指标",
+        fields,
+        score,
+        positives,
+        risks,
+        ["财务字段只使用不晚于分析日的公开披露；估值字段缺失时不参与评分。"],
+    )
+
+
+def fetch_us_fundamentals_eastmoney(symbol: str, last_price: float | None) -> EvidenceSnapshot:
+    if ak is None:
+        return EvidenceSnapshot(False, "AKShare未安装", notes=["东方财富美股财务备用通道不可用。"])
+    code = normalize_us_code(symbol)
+    raw = ak.stock_financial_us_analysis_indicator_em(symbol=code, indicator="年报")
+    row = _latest_public_financial_row(raw, ("NOTICE_DATE", "STD_REPORT_DATE", "REPORT_DATE"))
+    if not row:
+        return EvidenceSnapshot(False, "东方财富美股财务指标", notes=["财务备用通道没有返回公开报告。"])
+    eps = safe_float(row.get("DILUTED_EPS")) or safe_float(row.get("BASIC_EPS"))
+    fields = {
+        "公司名称": row.get("SECURITY_NAME_ABBR") or code,
+        "行业": "未取得",
+        "报告期": str(row.get("REPORT_DATA_TYPE") or row.get("REPORT_DATE") or "最近公开年报"),
+        "实际披露日期": str(row.get("NOTICE_DATE") or "未取得"),
+        "净资产收益率": percent_fraction(row.get("ROE_AVG")),
+        "净利率": percent_fraction(row.get("NET_PROFIT_RATIO")),
+        "净利润同比": percent_fraction(row.get("PARENT_HOLDER_NETPROFIT_YOY")),
+        "营收同比": percent_fraction(row.get("OPERATE_INCOME_YOY")),
+        "资产负债率": percent_fraction(row.get("DEBT_ASSET_RATIO")),
+        "经营现金流／净利润": None,
+        "市盈率TTM": last_price / eps if last_price is not None and eps not in {None, 0} else None,
+    }
+    score, positives, risks = _score_fundamentals(fields)
+    return EvidenceSnapshot(
+        score is not None,
+        "AKShare／东方财富美股公开财务指标",
+        fields,
+        score,
+        positives,
+        risks,
+        ["备用财务数据采用最近已披露年报；简化市盈率不是专业估值终端口径。"],
+    )
+
+
+def fetch_hk_fundamentals_eastmoney(code: str, last_price: float | None) -> EvidenceSnapshot:
+    if ak is None:
+        return EvidenceSnapshot(False, "AKShare未安装", notes=["东方财富港股财务备用通道不可用。"])
+    normalized = normalize_hk_code(code)
+    raw = ak.stock_financial_hk_analysis_indicator_em(symbol=normalized, indicator="年度")
+    row = _latest_public_financial_row(raw, ("REPORT_DATE", "START_DATE"))
+    if not row:
+        return EvidenceSnapshot(False, "东方财富港股财务指标", notes=["财务备用通道没有返回公开报告。"])
+    eps = safe_float(row.get("EPS_TTM")) or safe_float(row.get("DILUTED_EPS")) or safe_float(row.get("BASIC_EPS"))
+    cash_per_share = safe_float(row.get("PER_NETCASH_OPERATE"))
+    cash_quality = cash_per_share / eps if cash_per_share is not None and eps not in {None, 0} else None
+    fields = {
+        "公司名称": row.get("SECURITY_NAME_ABBR") or normalized,
+        "行业": "未取得",
+        "报告期": str(row.get("REPORT_DATE") or "最近公开年报"),
+        "净资产收益率": percent_fraction(row.get("ROE_AVG")),
+        "净利率": percent_fraction(row.get("NET_PROFIT_RATIO")),
+        "净利润同比": percent_fraction(row.get("HOLDER_PROFIT_YOY")),
+        "营收同比": percent_fraction(row.get("OPERATE_INCOME_YOY")),
+        "资产负债率": percent_fraction(row.get("DEBT_ASSET_RATIO")),
+        "经营现金流／净利润": cash_quality,
+        "市盈率TTM": last_price / eps if last_price is not None and eps not in {None, 0} else None,
+    }
+    score, positives, risks = _score_fundamentals(fields)
+    return EvidenceSnapshot(
+        score is not None,
+        "AKShare／东方财富港股公开财务指标",
+        fields,
+        score,
+        positives,
+        risks,
+        ["备用财务数据采用最近已公开年度报告；缺失字段不参与评分。"],
+    )
+
+
 def fetch_a_fundamentals(code: str, last_price: float, asset_type: str) -> EvidenceSnapshot:
     if asset_type != "A股个股":
         return EvidenceSnapshot(False, "不适用", notes=["场内基金不使用单一上市公司的财务报表评分。"])
-    if bs is None:
-        return EvidenceSnapshot(False, "BaoStock未安装", notes=["未取得财务数据，不参与评分。"])
-    bao_code = a_share_baostock_code(code)
-    login_result = bs.login()
-    if login_result.error_code != "0":
-        return EvidenceSnapshot(False, "BaoStock", notes=[f"财务接口登录失败：{login_result.error_msg}"])
-    fields: dict[str, Any] = {}
     notes: list[str] = []
-    name = code
-    industry = "未取得"
+    if bs is not None:
+        bao_code = a_share_baostock_code(code)
+        logged_in = False
+        fields: dict[str, Any] = {}
+        try:
+            login_result = bs.login()
+            logged_in = login_result.error_code == "0"
+            if not logged_in:
+                notes.append(f"BaoStock财务登录失败：{login_result.error_msg}")
+            else:
+                basic = _bao_first_row(bs.query_stock_basic(code=bao_code))
+                name = str(basic.get("code_name") or code)
+                industry_row = _bao_first_row(bs.query_stock_industry(code=bao_code))
+                industry = str(industry_row.get("industry") or "未取得")
+                latest_period = ""
+                for year, quarter in _recent_report_quarters():
+                    profit = _bao_first_row(bs.query_profit_data(code=bao_code, year=year, quarter=quarter))
+                    if not profit:
+                        continue
+                    growth = _bao_first_row(bs.query_growth_data(code=bao_code, year=year, quarter=quarter))
+                    balance = _bao_first_row(bs.query_balance_data(code=bao_code, year=year, quarter=quarter))
+                    cashflow = _bao_first_row(bs.query_cash_flow_data(code=bao_code, year=year, quarter=quarter))
+                    latest_period = str(profit.get("statDate") or f"{year}Q{quarter}")
+                    previous_profit = _bao_first_row(bs.query_profit_data(code=bao_code, year=year - 1, quarter=quarter))
+                    current_revenue = safe_float(profit.get("MBRevenue"))
+                    previous_revenue = safe_float(previous_profit.get("MBRevenue"))
+                    revenue_growth = (
+                        current_revenue / previous_revenue - 1
+                        if current_revenue is not None and previous_revenue not in {None, 0}
+                        else None
+                    )
+                    fields.update(
+                        {
+                            "公司名称": name,
+                            "行业": industry,
+                            "报告期": latest_period,
+                            "净资产收益率": safe_float(profit.get("roeAvg")),
+                            "净利率": safe_float(profit.get("npMargin")),
+                            "净利润同比": safe_float(growth.get("YOYNI")),
+                            "营收同比": revenue_growth,
+                            "资产负债率": safe_float(balance.get("liabilityToAsset")),
+                            "经营现金流／净利润": safe_float(cashflow.get("CFOToNP")),
+                            "每股收益TTM": safe_float(profit.get("epsTTM")),
+                        }
+                    )
+                    break
+                eps = safe_float(fields.get("每股收益TTM"))
+                fields["市盈率TTM"] = last_price / eps if eps is not None and eps != 0 else None
+                score, positives, risks = _score_fundamentals(fields)
+                if score is not None:
+                    return EvidenceSnapshot(True, "BaoStock公开财务数据", fields, score, positives, risks, notes)
+                notes.append("BaoStock返回字段不足，已切换东方财富财务备用通道。")
+        except Exception as exc:
+            notes.append(f"BaoStock财务通道失败：{exc}")
+        finally:
+            if logged_in:
+                try:
+                    bs.logout()
+                except Exception:
+                    pass
+    else:
+        notes.append("BaoStock组件未安装，已切换东方财富财务备用通道。")
+
     try:
-        basic = _bao_first_row(bs.query_stock_basic(code=bao_code))
-        name = str(basic.get("code_name") or code)
-        industry_row = _bao_first_row(bs.query_stock_industry(code=bao_code))
-        industry = str(industry_row.get("industry") or "未取得")
-        latest_period = ""
-        for year, quarter in _recent_report_quarters():
-            profit = _bao_first_row(bs.query_profit_data(code=bao_code, year=year, quarter=quarter))
-            if not profit:
-                continue
-            growth = _bao_first_row(bs.query_growth_data(code=bao_code, year=year, quarter=quarter))
-            balance = _bao_first_row(bs.query_balance_data(code=bao_code, year=year, quarter=quarter))
-            cashflow = _bao_first_row(bs.query_cash_flow_data(code=bao_code, year=year, quarter=quarter))
-            latest_period = str(profit.get("statDate") or f"{year}Q{quarter}")
-            previous_profit = _bao_first_row(bs.query_profit_data(code=bao_code, year=year - 1, quarter=quarter))
-            current_revenue = safe_float(profit.get("MBRevenue"))
-            previous_revenue = safe_float(previous_profit.get("MBRevenue"))
-            revenue_growth = (
-                current_revenue / previous_revenue - 1
-                if current_revenue is not None and previous_revenue not in {None, 0}
-                else None
-            )
-            fields.update(
-                {
-                    "公司名称": name,
-                    "行业": industry,
-                    "报告期": latest_period,
-                    "净资产收益率": safe_float(profit.get("roeAvg")),
-                    "净利率": safe_float(profit.get("npMargin")),
-                    "净利润同比": safe_float(growth.get("YOYNI")),
-                    "营收同比": revenue_growth,
-                    "资产负债率": safe_float(balance.get("liabilityToAsset")),
-                    "经营现金流／净利润": safe_float(cashflow.get("CFOToNP")),
-                    "每股收益TTM": safe_float(profit.get("epsTTM")),
-                }
-            )
-            break
-        eps = safe_float(fields.get("每股收益TTM"))
-        fields["市盈率TTM"] = last_price / eps if eps is not None and eps != 0 else None
-        if not latest_period:
-            notes.append("公开接口没有返回近期财务报告。")
+        fallback = fetch_a_fundamentals_eastmoney(code, last_price)
+        fallback.notes = notes + list(fallback.notes)
+        return fallback
     except Exception as exc:
-        notes.append(f"部分财务数据获取失败：{exc}")
-    finally:
-        bs.logout()
-    score, positives, risks = _score_fundamentals(fields)
-    return EvidenceSnapshot(score is not None, "BaoStock公开财务数据", fields, score, positives, risks, notes)
+        notes.append(f"东方财富财务备用通道失败：{exc}")
+    return EvidenceSnapshot(False, "BaoStock／东方财富财务通道", notes=notes + ["财务数据缺失不阻断量价判断。"])
 
 
 def _sec_fact_series(facts: dict[str, Any], tags: tuple[str, ...], unit_names: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -1182,8 +1345,16 @@ def fetch_us_fundamentals(symbol: str, last_price: float | None = None) -> Evide
         sec_notes.extend(sec_result.notes)
     except Exception as exc:
         sec_notes.append(f"SEC财务接口暂不可用：{exc}")
+    try:
+        eastmoney_result = fetch_us_fundamentals_eastmoney(symbol, last_price)
+        eastmoney_result.notes = sec_notes + list(eastmoney_result.notes)
+        if eastmoney_result.available:
+            return eastmoney_result
+        sec_notes = list(eastmoney_result.notes)
+    except Exception as exc:
+        sec_notes.append(f"东方财富美股财务备用通道暂不可用：{exc}")
     if yf is None:
-        return EvidenceSnapshot(False, "美国SEC／yfinance", notes=sec_notes + ["未取得财务数据，不参与评分。"])
+        return EvidenceSnapshot(False, "美国SEC／东方财富／yfinance", notes=sec_notes + ["未取得财务数据，不参与评分。"])
     fields: dict[str, Any] = {}
     notes: list[str] = []
     try:
@@ -1214,33 +1385,43 @@ def fetch_us_fundamentals(symbol: str, last_price: float | None = None) -> Evide
 def fetch_hk_fundamentals(code: str, last_price: float | None = None) -> EvidenceSnapshot:
     normalized = normalize_hk_code(code)
     symbol = hk_yahoo_ticker(normalized)
-    if yf is None:
-        return EvidenceSnapshot(False, "yfinance未安装", notes=["未取得港股公司资料，不参与基本面评分。"])
     fields: dict[str, Any] = {}
     notes: list[str] = []
+    if yf is not None:
+        try:
+            info = yf.Ticker(symbol).get_info()
+            fields = {
+                "公司名称": info.get("longName") or info.get("shortName") or normalized,
+                "行业": info.get("industry") or info.get("sector") or "未取得",
+                "报告期": "Yahoo Finance最近可得口径",
+                "净资产收益率": safe_float(info.get("returnOnEquity")),
+                "净利率": safe_float(info.get("profitMargins")),
+                "净利润同比": safe_float(info.get("earningsGrowth")),
+                "营收同比": safe_float(info.get("revenueGrowth")),
+                "资产负债率": None,
+                "经营现金流／净利润": None,
+                "市盈率TTM": safe_float(info.get("trailingPE")),
+                "市净率": safe_float(info.get("priceToBook")),
+                "总市值": safe_float(info.get("marketCap")),
+            }
+            debt_to_equity = safe_float(info.get("debtToEquity"))
+            if debt_to_equity is not None:
+                fields["债务／权益"] = debt_to_equity / 100 if abs(debt_to_equity) > 5 else debt_to_equity
+            score, positives, risks = _score_fundamentals(fields)
+            if score is not None:
+                return EvidenceSnapshot(True, "Yahoo Finance港股公开公司资料", fields, score, positives, risks, notes)
+            notes.append("Yahoo公司资料字段不足，已切换东方财富财务备用通道。")
+        except Exception as exc:
+            notes.append(f"Yahoo港股公司资料暂不可用：{exc}")
+    else:
+        notes.append("yfinance未安装，已切换东方财富财务备用通道。")
     try:
-        info = yf.Ticker(symbol).get_info()
-        fields = {
-            "公司名称": info.get("longName") or info.get("shortName") or normalized,
-            "行业": info.get("industry") or info.get("sector") or "未取得",
-            "报告期": "Yahoo Finance最近可得口径",
-            "净资产收益率": safe_float(info.get("returnOnEquity")),
-            "净利率": safe_float(info.get("profitMargins")),
-            "净利润同比": safe_float(info.get("earningsGrowth")),
-            "营收同比": safe_float(info.get("revenueGrowth")),
-            "资产负债率": None,
-            "经营现金流／净利润": None,
-            "市盈率TTM": safe_float(info.get("trailingPE")),
-            "市净率": safe_float(info.get("priceToBook")),
-            "总市值": safe_float(info.get("marketCap")),
-        }
-        debt_to_equity = safe_float(info.get("debtToEquity"))
-        if debt_to_equity is not None:
-            fields["债务／权益"] = debt_to_equity / 100 if abs(debt_to_equity) > 5 else debt_to_equity
+        fallback = fetch_hk_fundamentals_eastmoney(normalized, last_price)
+        fallback.notes = notes + list(fallback.notes)
+        return fallback
     except Exception as exc:
-        notes.append(f"Yahoo港股公司资料暂不可用：{exc}")
-    score, positives, risks = _score_fundamentals(fields)
-    return EvidenceSnapshot(score is not None, "Yahoo Finance港股公开公司资料", fields, score, positives, risks, notes)
+        notes.append(f"东方财富港股财务备用通道暂不可用：{exc}")
+    return EvidenceSnapshot(False, "Yahoo Finance／东方财富港股财务通道", notes=notes + ["财务数据缺失不阻断量价判断。"])
 
 
 def derive_market_regime(benchmark: pd.DataFrame) -> dict[str, Any]:
@@ -1382,7 +1563,7 @@ def fetch_price_bundle(market: str, raw_code: str) -> PriceBundle:
     bundle.coverage_ratio = float(np.clip(actual_span / expected_span, 0, 1))
     bundle.history_complete = bool(first_date <= requested_start + pd.Timedelta(days=45))
     if not bundle.history_complete:
-        bundle.warnings.append("该股票可得历史不足五年。数据不足，无法准确判断，结果仅作低置信度参考。")
+        bundle.warnings.append("该股票可得历史不足五年；系统会使用实际可得行情继续分析，并下调可信度。")
     return bundle
 
 
@@ -1398,7 +1579,11 @@ def calculate_quant_metrics(stock: pd.DataFrame, benchmark: pd.DataFrame) -> dic
     else:
         benchmark_close = benchmark.set_index("日期")["收盘"].sort_index()
         benchmark_returns = benchmark_close.pct_change().dropna()
-    aligned = pd.concat([returns.rename("stock"), benchmark_returns.rename("benchmark")], axis=1).dropna().tail(756)
+    aligned = pd.concat(
+        [returns.rename("stock"), benchmark_returns.rename("benchmark")],
+        axis=1,
+        sort=False,
+    ).dropna().tail(756)
     beta = np.nan
     correlation = np.nan
     if len(aligned) >= 60 and aligned["benchmark"].var() > 0:
@@ -2196,10 +2381,13 @@ def _validate_timing_signal(frame: pd.DataFrame, days: int) -> dict[str, Any]:
         reliability_multiplier = 1.0
     elif limited:
         status = "有限通过"
-        reliability_multiplier = 0.5
+        reliability_multiplier = 0.70
     else:
-        status = "未通过"
-        reliability_multiplier = 0.0
+        # 历史检验只负责降低信号强度，不再把全部技术证据乘成零。
+        # 单只股票、单一期限很难同时满足全部统计条件；把它设为硬闸门
+        # 会使大量正常股票永远停留在50分，失去实际分析意义。
+        status = "参考性较弱"
+        reliability_multiplier = 0.35
 
     sample_points = min(samples / max(minimum_samples, 1), 1.0) * 25
     ic_points = float(np.clip((ic or 0.0) / 0.10, 0, 1) * 25)
@@ -2207,7 +2395,7 @@ def _validate_timing_signal(frame: pd.DataFrame, days: int) -> dict[str, Any]:
     spread_points = 15 if spread is not None and spread > 0 else 0
     hit_points = 15 if hit_rate is not None and hit_rate >= 0.55 else 8 if hit_rate is not None and hit_rate >= 0.52 else 3 if hit_rate is not None and hit_rate >= 0.50 else 0
     confidence = int(round(np.clip(sample_points + ic_points + stability_points + spread_points + hit_points, 0, 90)))
-    if status == "未通过":
+    if status == "参考性较弱":
         confidence = min(confidence, 39)
     elif status == "有限通过":
         confidence = min(max(confidence, 45), 59)
@@ -2219,9 +2407,9 @@ def _validate_timing_signal(frame: pd.DataFrame, days: int) -> dict[str, Any]:
     elif status == "通过":
         reason = "前后半段方向一致，且排序、分组收益差和方向命中均达到闸门。"
     elif status == "有限通过":
-        reason = "历史方向初步为正但强度有限，当前技术分只保留一半影响。"
+        reason = "历史方向初步为正但强度有限，当前技术分按70%计入。"
     else:
-        reason = "历史排序、稳定性、分组收益差或方向命中至少一项未达到要求。"
+        reason = "历史排序、稳定性、分组收益差或方向命中至少一项较弱；当前技术分降至35%计入，并标记为低可信度。"
 
     return {
         "status": status,
@@ -2419,18 +2607,14 @@ def score_horizons(
             analog_status = "当前期限没有可用的相似周期样本；不计分"
 
         signal_confidence = int(validation["confidence_score"])
-        direction_available = bool(
-            validation["status"] in {"通过", "有限通过"}
-            and signal_confidence >= 45
-        )
+        # 行情窗口完整时始终给出方向；历史验证只调整可信度和权重。
+        direction_available = True
         score_int = int(round(np.clip(score, 0, 100)))
-        if not direction_available:
-            label = "历史验证未通过／不判断方向"
-        elif score_int >= 70:
+        if score_int >= 65:
             label = "条件较积极"
-        elif score_int >= 60:
+        elif score_int >= 55:
             label = "中性偏积极"
-        elif score_int >= 45:
+        elif score_int >= 42:
             label = "中性观察"
         else:
             label = "偏弱／暂缓"
@@ -2518,10 +2702,10 @@ def choose_horizon(horizon_scores: list[dict[str, Any]], profile: dict[str, Any]
         notes.append("短线意向与看盘条件、纪律或市场信号不匹配，因此Agent没有选择最短周期。")
     if profile["earliest_need"] in {"1周内", "1个月内"}:
         notes.append("资金近期可能使用，任何股票持有周期都存在被迫在不利价格退出的风险。")
-    if not selected.get("direction_available"):
-        notes.append("该持有期由用户目标和资金期限确定，但历史验证未通过，因此不形成买入方向判断。")
-    else:
-        notes.append("持有期先按用户目标、资金期限和执行条件确定，没有从多个周期中挑选最高分。")
+    validation_status = str((selected.get("signal_validation") or {}).get("status") or "未验证")
+    if validation_status == "参考性较弱":
+        notes.append("该期限的历史稳定性较弱，系统已降低技术因子影响，但仍根据当前可见行情形成低可信度判断。")
+    notes.append("持有期先按用户目标、资金期限和执行条件确定，没有从多个周期中挑选最高分。")
     return selected, notes
 
 
@@ -2551,7 +2735,7 @@ def calculate_data_confidence(
         score += 18
     else:
         score += 5
-        notes.append("财务或估值数据未取得，结论主要基于行情。")
+        notes.append("财务或估值数据未取得，本项跳过；行情判断继续，不触发证据不足。")
     score += 7 if macro.available else 2
     if metrics["abnormal_days"]:
         score -= min(10, metrics["abnormal_days"] * 2)
@@ -2560,7 +2744,7 @@ def calculate_data_confidence(
         rows = int(metrics.get("rows", 0))
         cap = 30 if rows < 60 else 45 if rows < 250 else 65 if rows < 750 else 78
         score = min(score, cap)
-        notes.append("该股票可得历史不足五年。数据不足，无法准确判断。")
+        notes.append("该股票可得历史不足五年，已按实际可得样本降低可信度；只要周期窗口足够，行情判断继续。")
     if not metrics.get("benchmark_available", True):
         score = min(score, 72)
         notes.append("市场基准暂不可用，Beta和相对强弱未参与判断。")
@@ -2581,7 +2765,7 @@ def assess_suitability(
         hard_reasons.append("应急资金应优先保持安全性和流动性")
     if profile["emergency_reserve"] == "不足3个月" and profile["planned_amount"] / profile["investable_assets"] > 0.10:
         hard_reasons.append("应急储备不足且计划投入比例较高")
-    if data_confidence < 35 or selected_horizon is None:
+    if selected_horizon is None:
         return {"fit": "证据不足", "fit_reason": "公开数据不足以形成可靠判断", "hard_reasons": hard_reasons}
     if hard_reasons:
         return {"fit": "不适配", "fit_reason": hard_reasons[0], "hard_reasons": hard_reasons}
@@ -2604,18 +2788,18 @@ def position_budget(
 ) -> dict[str, Any]:
     if selected_horizon is None or suitability_result["fit"] in {"不适配", "证据不足"}:
         return {"lower_pct": 0.0, "upper_pct": 0.0, "lower_amount": 0.0, "upper_amount": 0.0, "stress_loss": None}
-    if not selected_horizon.get("direction_available"):
-        return {
-            "lower_pct": 0.0,
-            "upper_pct": 0.0,
-            "lower_amount": 0.0,
-            "upper_amount": 0.0,
-            "stress_loss": selected_horizon.get("stress_loss"),
-        }
     risk_budget = {1: 0.0025, 2: 0.005, 3: 0.010, 4: 0.020, 5: 0.030}[investor_level_number]
     cap = {1: 0.03, 2: 0.05, 3: 0.10, 4: 0.15, 5: 0.20}[investor_level_number]
     stress_loss = max(float(selected_horizon.get("stress_loss") or 0.0), 0.08)
     upper = min(risk_budget / stress_loss, cap)
+    reliability = float(
+        np.clip(
+            selected_horizon.get("technical_reliability_multiplier") or 0.35,
+            0.35,
+            1.0,
+        )
+    )
+    upper *= reliability
     if stock_risk_number == 5:
         upper *= 0.75
     if suitability_result["fit"] == "有限适配":
@@ -2624,9 +2808,9 @@ def position_budget(
     if concentration in {"30%—50%", "超过50%"}:
         upper *= 0.60
     timing_score = selected_horizon["score"]
-    if timing_score < 45:
+    if timing_score < 42:
         upper = 0.0
-    elif timing_score < 60:
+    elif timing_score < 55:
         upper *= 0.50
     lower = upper * 0.40 if upper > 0 else 0.0
     assets = float(profile["investable_assets"])
@@ -2645,24 +2829,27 @@ def build_final_conclusion(
     position: dict[str, Any],
 ) -> tuple[str, str]:
     fit = suitability_result["fit"]
-    if fit == "证据不足" or selected_horizon is None:
-        return "证据不足，暂不形成判断", "公开数据完整度不足，需要更可靠的数据源。"
+    if selected_horizon is None:
+        return "证据不足，暂不形成判断", "公开行情不足以计算任何可用持有周期。"
+
+    score = int(selected_horizon.get("score") or 0)
+    signal = str(selected_horizon.get("label") or "中性观察")
+    confidence = int(selected_horizon.get("signal_confidence") or 0)
+
+    if score < 42:
+        return "当前时点偏弱，暂缓", f"行情信号为“{signal}”，方向可信度{confidence}/100；当前不支持新增风险敞口。"
     if fit == "不适配":
-        return "不适合该用户", suitability_result["fit_reason"]
-    if not selected_horizon.get("direction_available"):
-        validation = selected_horizon.get("signal_validation") or {}
         return (
-            "个人条件可讨论，但方向证据不足",
-            f"所选持有期的历史验证{validation.get('status', '未通过')}，"
-            "因此本版不把当前技术状态解释为买入信号。",
+            f"行情为{signal}，但当前用户不适配",
+            f"股票行情判断仍然有效；个人层面因{suitability_result['fit_reason']}，仓位上限为0。",
         )
-    if selected_horizon["score"] < 45:
-        return "个人条件可讨论，但当前时点暂缓", "股票与用户并非绝对不匹配，但当前多周期信号偏弱。"
-    if selected_horizon["score"] < 60 or position["upper_pct"] <= 0.02:
-        return "可以小仓观察", "当前证据尚不支持较高风险预算，重点观察后续信号。"
+    if score < 55:
+        return "中性观察，等待确认", f"当前评分{score}/100，尚未达到积极区间；可继续观察，不等同于无法判断。"
+    if score < 65:
+        return "可以小仓观察", f"行情信号中性偏积极，方向可信度{confidence}/100；只在个人风险预算内小仓分批。"
     if fit == "有限适配":
-        return "条件适配，可进一步研究", "风险等级略高于用户等级，需要严格限制仓位并按期复核。"
-    return "在风险预算内相对适配", "个人条件与股票风险基本匹配，但仍需满足仓位和复核条件。"
+        return "条件适配，可小仓分批研究", "行情信号较积极，但股票风险高于用户等级一级，需要降低仓位并按期复核。"
+    return "在风险预算内可分批关注", f"当前行情信号为“{signal}”，个人风险条件覆盖该股票风险；仍需遵守仓位上限。"
 
 
 def _personal_loss_cap(max_loss: str | None) -> float:
