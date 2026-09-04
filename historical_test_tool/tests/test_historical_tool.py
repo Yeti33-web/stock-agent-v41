@@ -169,11 +169,45 @@ class HistoricalToolTests(unittest.TestCase):
         self.assertEqual(result.analysis["investor_level"], expected_level)
         self.assertEqual(result.profile["profile_name"], "用户本次实际填写画像")
 
+    def test_v7_decision_layer_is_replayed_without_post_t_data(self):
+        stock, benchmark = self.synthetic_history()
+        with (
+            patch.object(agent_core, "fetch_a_security", return_value=(stock, "测试股票", "合成日线")),
+            patch.object(agent_core, "fetch_a_benchmark", return_value=benchmark),
+        ):
+            result = run_full_historical_agent("A股", "600000", date(2024, 6, 1), self.user_profile())
+        decision = result.analysis.get("historical_decision")
+        self.assertIsInstance(decision, dict)
+        self.assertTrue(decision)
+        if decision.get("available"):
+            self.assertEqual(decision.get("engine_version"), "V7.0.0")
+            self.assertIn("composite_score", decision)
+            for item in (decision.get("historical") or {}).get("matches", []):
+                self.assertLessEqual(
+                    str(item.get("anchor_date")),
+                    "2024-05-31",
+                    "历史相似案例的锚定日期不得晚于冻结日T",
+                )
+
+    def test_replay_snapshot_reports_decision_layer_and_cutoff_guard(self):
+        stock, benchmark = self.synthetic_history()
+        with (
+            patch.object(agent_core, "fetch_a_security", return_value=(stock, "测试股票", "合成日线")),
+            patch.object(agent_core, "fetch_a_benchmark", return_value=benchmark),
+        ):
+            snapshot = run_historical_replay("A股", "600000", date(2024, 6, 1), self.user_profile())
+        self.assertIn("历史情景决策层", snapshot)
+        self.assertIn("可用", snapshot["历史情景决策层"])
+        self.assertEqual(snapshot["防未来数据检查"]["冻结日期"], "2024-05-31")
+        self.assertIn("V7决策层输入", snapshot["防未来数据检查"])
+        self.assertIn("V7.0.0", snapshot["tool_version"])
+
     def test_original_v64_result_renderers_are_reused(self):
         ui = load_original_ui()
         renderer_names = [
             "render_summary",
             "render_sell_signals",
+            "render_historical_decision",
             "render_analog_forecast",
             "render_news_analysis",
             "render_risk_budget",

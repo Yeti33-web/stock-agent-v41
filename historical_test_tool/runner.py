@@ -20,6 +20,13 @@ from historical_test_tool.historical_data import (
 )
 from historical_test_tool.point_in_time import build_point_in_time_evidence, empty_historical_news_payload
 
+# Agent A V7.0.0 新增的历史情景决策层。回测工具始终跟随当前A版本：
+# 若分支中的A尚未包含该模块，则自动降级，不影响V6.5.2核心流程复现。
+try:
+    from historical_decision import build_v7_decision
+except Exception:  # pragma: no cover - 仅在A版本较旧时触发
+    build_v7_decision = None
+
 
 @dataclass
 class FullReplayResult:
@@ -162,6 +169,17 @@ def run_full_historical_agent(
         analysis = agent_core.analyze_all(bundle, active_profile, fundamental, macro)
         selected_score = (analysis.get("selected_horizon") or {}).get("score")
         analysis["news_analysis"] = assess_news(news_payload, selected_score)
+        if build_v7_decision is not None:
+            try:
+                analysis["historical_decision"] = build_v7_decision(
+                    bundle, analysis, news_result=analysis["news_analysis"]
+                )
+            except Exception as decision_exc:
+                analysis["historical_decision"] = {
+                    "available": False,
+                    "engine_version": "V7.0.0",
+                    "reason": f"决策层属于新增展示模块，本次历史复现生成失败：{type(decision_exc).__name__}，不影响原有结论。",
+                }
         analysis["factor_analysis"] = factor_analysis.build_factor_analysis(bundle, analysis, active_profile)
         current_holding = float(active_profile.get("current_holding_value") or 0.0)
         assets = float(active_profile.get("investable_assets") or 0.0)
@@ -190,6 +208,38 @@ def run_full_historical_agent(
         evidence_status=evidence_status,
         fx_snapshot=fx_snapshot,
     )
+
+
+def _compact_decision(decision: dict[str, Any]) -> dict[str, Any]:
+    """Summarize the V7 decision layer for the replay snapshot without post-T data."""
+
+    if not decision:
+        return {"可用": False, "说明": "当前分支的Agent A未包含V7.0.0历史情景决策层，未参与本次复现。"}
+    if not decision.get("available"):
+        return {
+            "可用": False,
+            "引擎版本": decision.get("engine_version"),
+            "说明": decision.get("reason") or "决策层各模块均不可用。",
+        }
+    weights = decision.get("weights") or {}
+    evidence = decision.get("evidence") or {}
+    historical = decision.get("historical") or {}
+    return {
+        "引擎版本": decision.get("engine_version"),
+        "可用": True,
+        "综合决策分": _safe_number(decision.get("composite_score")),
+        "建议": decision.get("recommendation"),
+        "建议理由": decision.get("recommendation_reason"),
+        "置信度": _safe_number(decision.get("confidence")),
+        "建议仓位上限比例": _safe_number(decision.get("suggested_position_pct")),
+        "证据等级": evidence.get("level"),
+        "证据分": _safe_number(evidence.get("evidence_score")),
+        "动态权重_百分比": weights.get("weights_pct"),
+        "模块得分": {key: _safe_number(value) for key, value in (decision.get("module_scores") or {}).items()},
+        "历史相似样本数": historical.get("sample_count"),
+        "防未来数据守卫": historical.get("guard"),
+        "权重说明": list(weights.get("reasons") or []),
+    }
 
 
 def run_historical_replay(
@@ -222,7 +272,7 @@ def run_historical_replay(
     )
 
     snapshot = {
-        "tool_version": "完整界面独立历史时点测试工具V2.2（同步Agent A V6.5.2）",
+        "tool_version": "完整界面独立历史时点测试工具V2.3（同步Agent A V7.0.0，含历史情景决策层）",
         "回测范围": "只复现T日Agent判断；不读取、不计算、不评价T日之后走势",
         "测试条件": {
             "市场": market,
@@ -265,12 +315,14 @@ def run_historical_replay(
         "全部现有周期评分": _compact_horizons(analysis),
         "因子贡献": contributions,
         "历史证据状态": evidence_status,
+        "历史情景决策层": _compact_decision(dict(analysis.get("historical_decision") or {})),
         "防未来数据检查": {
             "冻结日期": actual_date,
             "个股最大日期": stock_last,
             "基准最大日期": benchmark_last,
             "T后行情传入Agent行数": 0,
             "T后财务_宏观利率_资讯传入": False,
+            "V7决策层输入": "仅使用T日及以前的行情、成交量与基准数据；历史相似检索在截断后序列内进行",
         },
         "测试画像明细": active_profile,
     }

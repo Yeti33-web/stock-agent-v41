@@ -16,6 +16,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from agent_core import MODEL_VERSION, normalize_a_code, normalize_hk_code, normalize_us_code, score_investor
+
+try:
+    from lookahead_guard import DECISION_ENGINE_VERSION
+except Exception:  # A版本较旧时尚未包含历史情景决策层
+    DECISION_ENGINE_VERSION = None
 from questionnaire import (
     QUESTIONS,
     answers_complete,
@@ -100,9 +105,14 @@ def initialize_state() -> None:
 
 
 def render_test_notice() -> None:
+    engine_text = (
+        f"；历史情景决策层同步至{DECISION_ENGINE_VERSION}"
+        if DECISION_ENGINE_VERSION
+        else "；当前分支的Agent A尚未包含历史情景决策层"
+    )
     st.info(
         "这是与正式Agent分开的历史时点测试页面。除历史日期T和不写入正式账号／会话外，"
-        f"风险测评、投资输入、分析规则和结果页面均沿用{MODEL_VERSION}。"
+        f"风险测评、投资输入、分析规则和结果页面均沿用{MODEL_VERSION}{engine_text}。"
     )
 
 
@@ -321,7 +331,7 @@ def render_result_tabs(bundle, analysis, profile) -> None:
     tab_names = ["结论"]
     if st.session_state.confirmed_holding_state == "已经持有":
         tab_names.append("卖出信号")
-    tab_names.extend(["相似周期预测", "最新资讯", "风险与仓位", "持有周期", "因子解释与验证", "数据证据"])
+    tab_names.extend(["历史情景决策", "相似周期预测", "最新资讯", "风险与仓位", "持有周期", "因子解释与验证", "数据证据"])
     if view_mode == "专业模式":
         tab_names.append("专业指标")
     tabs = st.tabs(tab_names)
@@ -331,6 +341,8 @@ def render_result_tabs(bundle, analysis, profile) -> None:
     if "卖出信号" in tab_map:
         with tab_map["卖出信号"]:
             original_ui.render_sell_signals(bundle, analysis, profile)
+    with tab_map["历史情景决策"]:
+        original_ui.render_historical_decision(bundle, analysis)
     with tab_map["相似周期预测"]:
         original_ui.render_analog_forecast(analysis)
     with tab_map["最新资讯"]:
@@ -360,7 +372,8 @@ def result_page() -> None:
                 status.write("1/5 获取T日以前约五年的股票与基准行情")
                 status.write("2/5 应用当次填写的风险资料、资金和持仓信息")
                 status.write("3/5 排除T日后财务、利率和资讯")
-                status.write(f"4/5 调用{MODEL_VERSION}评分、风险、方向验证、周期和仓位逻辑")
+                status.write(f"4/5 调用{MODEL_VERSION}评分、风险、方向验证、周期和仓位逻辑"
+                             + ("，并复现V7.0.0历史情景决策层" if DECISION_ENGINE_VERSION else ""))
                 result = run_full_historical_agent(
                     market=market,
                     raw_code=code,
