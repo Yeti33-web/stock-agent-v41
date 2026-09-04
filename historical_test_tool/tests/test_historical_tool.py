@@ -4,6 +4,7 @@ import ast
 from datetime import date
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -19,8 +20,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import agent_core
 from questionnaire import QUESTIONS, answers_to_profile, compose_analysis_profile
+from historical_test_tool import news_archive
 from historical_test_tool.historical_data import assert_bundle_cutoff, fetch_historical_bundle
 from historical_test_tool.original_ui import _keep_original_ui_node, load_original_ui
+from historical_test_tool.point_in_time import build_point_in_time_news
 from historical_test_tool.runner import (
     frozen_agent_date,
     run_full_historical_agent,
@@ -201,6 +204,61 @@ class HistoricalToolTests(unittest.TestCase):
         self.assertEqual(snapshot["防未来数据检查"]["冻结日期"], "2024-05-31")
         self.assertIn("V7决策层输入", snapshot["防未来数据检查"])
         self.assertIn("V7.0.0", snapshot["tool_version"])
+
+    @staticmethod
+    def _seed_archive(db: Path, rows: list[tuple]) -> None:
+        connection = news_archive._connect(db)
+        connection.executemany(
+            "INSERT OR IGNORE INTO news (market, code, title, summary, source, published_at, url, provider)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        connection.commit()
+        connection.close()
+
+    def test_news_archive_only_feeds_items_published_by_t(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "news_archive.db"
+            self._seed_archive(
+                db,
+                [
+                    ("A股", "600000", "测试股票中标大额合同", "摘要", "测试媒体", "2024-05-20 09:00:00", "http://e/1", "东方财富历史资讯档案"),
+                    ("A股", "600000", "测试股票发布业绩预告", "摘要", "测试媒体", "2024-06-03 09:00:00", "http://e/2", "东方财富历史资讯档案"),
+                ],
+            )
+            payload = news_archive.load_historical_news_payload("A股", "600000", "测试股票", date(2024, 6, 1), db_path=db)
+            self.assertIsNotNone(payload)
+            dates = [str(item.get("published_at") or "") for item in payload["items"]]
+            self.assertTrue(dates)
+            self.assertTrue(all(d <= "2024-06-01" for d in dates), f"T后资讯泄露：{dates}")
+            missing = news_archive.load_historical_news_payload(
+                "A股", "600000", "测试股票", date(2024, 6, 1), db_path=Path(tmp) / "missing.db"
+            )
+            self.assertIsNone(missing)
+            payload2, status = build_point_in_time_news("A股", "600000", "测试股票", date(2024, 6, 1))
+            self.assertIn("不参与", status)
+
+    def test_runner_uses_archive_news_and_reports_status(self):
+        stock, benchmark = self.synthetic_history()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "news_archive.db"
+            self._seed_archive(
+                db,
+                [
+                    ("A股", "600000", "测试股票中标大额合同", "摘要", "测试媒体", "2024-05-20 09:00:00", "http://e/1", "东方财富历史资讯档案"),
+                    ("A股", "600000", "测试股票签约长期供货协议", "摘要", "测试媒体", "2024-05-22 09:00:00", "http://e/3", "东方财富历史资讯档案"),
+                ],
+            )
+            with (
+                patch.object(agent_core, "fetch_a_security", return_value=(stock, "测试股票", "合成日线")),
+                patch.object(agent_core, "fetch_a_benchmark", return_value=benchmark),
+                patch.object(news_archive, "DEFAULT_DB", db),
+            ):
+                result = run_full_historical_agent("A股", "600000", date(2024, 6, 1), self.user_profile())
+        self.assertIn("参与", result.evidence_status["历史资讯"])
+        items = (result.analysis.get("news_analysis") or {}).get("items") or []
+        self.assertGreaterEqual(len(items), 1)
+        self.assertTrue(all(str(item.get("published_at") or "") <= "2024-06-01" for item in items))
 
     def test_original_v64_result_renderers_are_reused(self):
         ui = load_original_ui()

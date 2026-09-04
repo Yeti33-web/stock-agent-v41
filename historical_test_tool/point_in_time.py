@@ -64,3 +64,20 @@ def empty_historical_news_payload(market: str, code: str, name: str, as_of: date
         "warnings": ["未接入带可核验历史发布时间的资讯库，资讯修正固定为0分。"],
     }
 
+
+def build_point_in_time_news(market: str, code: str, name: str, as_of: date) -> tuple[dict[str, Any], str]:
+    """Prefer the local news archive (publish time <= T); degrade honestly when absent."""
+
+    try:
+        from historical_test_tool import news_archive
+    except Exception:
+        import news_archive  # type: ignore[no-redef]
+    try:
+        payload = news_archive.load_historical_news_payload(market, code, name, as_of)
+    except Exception:
+        payload = None
+    if payload:
+        count = len(payload.get("items") or [])
+        return payload, f"参与；仅使用档案中发布时间不晚于T的{count}条资讯"
+    return empty_historical_news_payload(market, code, name, as_of), "本地档案未覆盖，不参与"
+

@@ -371,7 +371,7 @@ def result_page() -> None:
             try:
                 status.write("1/5 获取T日以前约五年的股票与基准行情")
                 status.write("2/5 应用当次填写的风险资料、资金和持仓信息")
-                status.write("3/5 排除T日后财务、利率和资讯")
+                status.write("3/5 仅载入T日可核验的财务／利率／资讯（资讯优先读本地历史档案，无档案自动降级）")
                 status.write(f"4/5 调用{MODEL_VERSION}评分、风险、方向验证、周期和仓位逻辑"
                              + ("，并复现V7.0.0历史情景决策层" if DECISION_ENGINE_VERSION else ""))
                 result = run_full_historical_agent(

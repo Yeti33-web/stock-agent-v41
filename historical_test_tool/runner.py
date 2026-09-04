@@ -18,7 +18,11 @@ from historical_test_tool.historical_data import (
     fetch_historical_bundle,
     fetch_historical_fx,
 )
-from historical_test_tool.point_in_time import build_point_in_time_evidence, empty_historical_news_payload
+from historical_test_tool.point_in_time import (
+    build_point_in_time_evidence,
+    build_point_in_time_news,
+    empty_historical_news_payload,
+)
 
 # Agent A V7.0.0 新增的历史情景决策层。回测工具始终跟随当前A版本：
 # 若分支中的A尚未包含该模块，则自动降级，不影响V6.5.2核心流程复现。
@@ -163,7 +167,9 @@ def run_full_historical_agent(
         active_profile["holding_state"] = "尚未持有"
 
     fundamental, macro, evidence_status = build_point_in_time_evidence(agent_core, bundle, actual_date)
-    news_payload = empty_historical_news_payload(market, bundle.code, bundle.name, actual_date)
+    news_payload, news_status = build_point_in_time_news(market, bundle.code, bundle.name, actual_date)
+    evidence_status = dict(evidence_status)
+    evidence_status["历史资讯"] = news_status
 
     with frozen_agent_date(agent_core, actual_date):
         analysis = agent_core.analyze_all(bundle, active_profile, fundamental, macro)
