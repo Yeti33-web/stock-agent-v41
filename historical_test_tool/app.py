@@ -104,18 +104,6 @@ def initialize_state() -> None:
             st.session_state[key] = value
 
 
-def render_test_notice() -> None:
-    engine_text = (
-        f"；历史情景决策层同步至{DECISION_ENGINE_VERSION}"
-        if DECISION_ENGINE_VERSION
-        else "；当前分支的Agent A尚未包含历史情景决策层"
-    )
-    st.info(
-        "这是与正式Agent分开的历史时点测试页面。除历史日期T和不写入正式账号／会话外，"
-        f"风险测评、投资输入、分析规则和结果页面均沿用{MODEL_VERSION}{engine_text}。"
-    )
-
-
 def validate_code(market: str, code: str) -> str:
     if market == "A股":
         return normalize_a_code(code)
@@ -135,7 +123,6 @@ def questionnaire_page() -> None:
     index = int(st.session_state.historical_question_index)
     total = len(QUESTIONS)
     original_ui.render_brand(f"独立测试使用{MODEL_VERSION}完整个人风险测评")
-    render_test_notice()
     if index < total:
         question = QUESTIONS[index]
         st.progress((index + 1) / total, text=f"第 {index + 1} / {total} 题")
@@ -206,7 +193,6 @@ def analysis_page() -> None:
     profile = dict(st.session_state.historical_saved_profile)
     record = dict(st.session_state.historical_profile_record or {})
     original_ui.render_brand("完整复现原Agent；唯一新增输入为历史分析日期T")
-    render_test_notice()
     risk_cols = st.columns([1, 1, 1.4])
     risk_cols[0].metric("个人风险等级", record.get("risk_level", "—"), f"{record.get('risk_score', '—')}/100")
     risk_cols[1].metric("测评版本", "本次独立测试")
@@ -365,7 +351,6 @@ def result_page() -> None:
     code = str(st.session_state.confirmed_stock_code)
     requested_date = st.session_state.historical_requested_date
     original_ui.render_brand(f"历史时点测试｜假设当前日期为 {requested_date}｜{market}｜{code}")
-    render_test_notice()
     if st.session_state.historical_result is None:
         with st.status("正在按历史时点运行完整Agent……", expanded=True) as status:
             try:
